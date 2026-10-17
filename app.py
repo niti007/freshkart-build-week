@@ -25,6 +25,8 @@ def why(m):
     with st.expander("Why this answer?"):
         st.markdown(f"Route: :{COLORS[m['route']]}[**{m['route']}**]")
         st.markdown("Reasons: " + "; ".join(m["reasons"]))
+        if m.get("pii_count"):
+            st.markdown(f":shield: PII masked: **{m['pii_count']} items** (before any prompt)")
         st.json(m["signals"])
 
 # Sidebar
@@ -56,7 +58,8 @@ with tab_chat:
                 decision = router.invoke({"input": msg, "chat_history": history.messages})
             reply = st.write_stream(reply_chain.stream(decision))
             m = {"role": "assistant", "content": reply, "route": decision["route"],
-                 "reasons": decision["reasons"], "signals": decision["signals"]}
+                 "reasons": decision["reasons"], "signals": decision["signals"],
+                 "pii_count": decision["pii_count"]}
             why(m)
         history.add_user_message(msg)
         history.add_ai_message(reply)
@@ -84,6 +87,8 @@ with tab_data:
 with tab_how:
     st.code("""
  {input, chat_history}
+        |
+ RunnablePassthrough.assign(masked_input, pii_count)   Ex1: mask phone/email/UPI/card for prompts
         |
  RunnableLambda(find_order_id)        regex: FK1001 / fk1001 / ord_1001
         |

@@ -284,6 +284,88 @@ def test_missing_key_shows_error(monkeypatch, fake_bot):
     at = app()
     assert at.error and "OPENROUTER_API_KEY" in at.error[0].value
 
+# ---- Ex1: PII shield ----
+PII_RAW = ["98450 12345", "ravi.k@gmail.com", "ravi@okaxis"]
+
+@pytest.mark.parametrize("text,masked,count", [
+    (X["X1"], "Please call me on [PHONE] or mail [EMAIL], UPI [UPI]. FK1001 mein Britannia bread missing tha, refund do.", 3),
+    ("call +91 98450 12345 now", "call [PHONE] now", 1),
+    ("call +91-9845012345", "call [PHONE]", 1),
+    ("my number is 9845012345.", "my number is [PHONE].", 1),
+    ("card 4111 1111 1111 1111 please", "card [CARD] please", 1),
+    ("card 4111-1111-1111-1111", "card [CARD]", 1),
+    ("card 6011111111111117", "card [CARD]", 1),
+    ("aadhaar-like 1234 5678 9012", "aadhaar-like [CARD]", 1),
+    ("mail me at first.last+fk@mail.co.in.", "mail me at [EMAIL].", 1),
+    ("pay to 9845012345@paytm", "pay to [UPI]", 1),
+    ("upi: name.k@ybl", "upi: [UPI]", 1),
+    (BY_ID["T13"]["message"], BY_ID["T13"]["message"], 0),
+    ("FK1001 ord_1010 FK 1002 ₹520 Rs. 1,200 INR 300", "FK1001 ord_1010 FK 1002 ₹520 Rs. 1,200 INR 300", 0),
+    ("delivered 2026-10-12 18:40, 38 min late, 11 Oct", "delivered 2026-10-12 18:40, 38 min late, 11 Oct", 0),
+    ("short 12345 and 98450", "short 12345 and 98450", 0),
+    ("", "", 0),
+])
+def test_mask_pii(fake_bot, text, masked, count):
+    assert fake_bot.mask_pii(text) == (masked, count)
+
+def test_x1_intent_prompt_is_masked_but_routing_unchanged(fake_bot):
+    d = decide(fake_bot, X["X1"])
+    seen = calls("intent")[-1]["human"]
+    assert "[PHONE]" in seen and "[EMAIL]" in seen and "[UPI]" in seen and "FK1001" in seen
+    assert not any(p in seen for p in PII_RAW)
+    assert d["order_id"] == "FK1001" and d["route"] == "auto_refund"
+    assert d["input"] == X["X1"] and d["pii_count"] == 3
+
+def test_x1_intent_prompt_text_via_to_string(fake_bot):
+    d = fake_bot.mask.invoke({"input": X["X1"], "chat_history": []})
+    shown = fake_bot.intent_prompt.invoke(fake_bot.masked.invoke(d)).to_string()
+    assert "[PHONE]" in shown and "98450" not in shown
+
+def test_no_llm_call_ever_sees_raw_pii(fake_bot):
+    d = decide(fake_bot, X["X1"])
+    fake_bot.reply_chain.invoke(d)
+    text = " ".join(m.content for c in calls() for m in c["messages"])
+    assert calls("lane") and not any(p in text for p in PII_RAW)
+
+def test_lane_prompt_reads_masked_input(fake_bot):
+    fake_bot.reply_chain.invoke(decide(fake_bot, X["X1"]))
+    assert calls("lane")[-1]["human"].startswith("Please call me on [PHONE]")
+
+def test_history_is_masked_but_order_id_still_recovered(fake_bot):
+    hist = [HumanMessage(content="FK1016 ka refund? call 9845012345"), AIMessage(content="Checking.")]
+    d = decide(fake_bot, "refund kab milega?", hist)
+    assert d["order_id"] == "FK1016"
+    assert "9845012345" not in d["chat_history"][0].content and "[PHONE]" in d["chat_history"][0].content
+    fake_bot.reply_chain.invoke(d)
+    assert "9845012345" not in " ".join(m.content for m in calls("lane")[-1]["messages"])
+    assert hist[0].content.endswith("9845012345")  # the caller's history object is not modified
+
+def test_t13_amount_not_masked(fake_bot):
+    d = decide(fake_bot, BY_ID["T13"]["message"])
+    assert d["signals"]["claimed_amount"] == 520.0 and d["masked_input"] == d["input"] and d["pii_count"] == 0
+
+def test_regex_signals_read_original_input(fake_bot):
+    d = decide(fake_bot, "FK1001 bread missing, ₹1500 refund do. Call 9845012345, bacche ko ulti ho rahi hai")
+    assert d["signals"]["claimed_amount"] == 1500.0 and d["signals"]["safety"] is True
+    assert d["route"] == "human_review"
+
+def test_ui_shows_pii_badge(fake_bot):
+    at = app()
+    at.chat_input[0].set_value(X["X1"]).run()
+    assert not at.exception
+    assert any("PII masked: **3 items**" in md.value for md in at.expander[0].markdown)
+    assert at.session_state["messages"][1]["pii_count"] == 3
+
+def test_ui_no_pii_badge_without_pii(fake_bot):
+    at = app()
+    at.chat_input[0].set_value(BY_ID["T01"]["message"]).run()
+    assert not any("PII masked" in md.value for md in at.expander[0].markdown)
+
+@live
+def test_live_x1_masked_and_auto_refund(real_bot):
+    d = decide(real_bot, X["X1"])
+    assert d["route"] == "auto_refund" and d["order_id"] == "FK1001" and d["pii_count"] == 3
+
 # ---- live (real OpenRouter calls) ----
 @live
 @pytest.mark.parametrize("tid,route", [("T09", "human_review"), ("T01", "auto_refund")])
