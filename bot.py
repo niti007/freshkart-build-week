@@ -152,10 +152,11 @@ def trace_table(trace):
     """Rows for display: seconds since the first station started, and how long each station took (None = running)."""
     if not trace: return []
     t0 = min(e["start"] for e in trace)
-    rows = [{"station": e["name"], "at_s": round((e["start"] - t0).total_seconds(), 2),
+    done = sorted((e for e in list(trace) if e["end"]), key=lambda e: e["end"])  # finish order, exact times
+    running = sorted((e for e in list(trace) if not e["end"]), key=lambda e: e["start"])
+    return [{"station": e["name"], "at_s": round((e["start"] - t0).total_seconds(), 2),
              "seconds": round((e["end"] - e["start"]).total_seconds(), 2) if e["end"] else None,
-             "thread": e["thread"]} for e in list(trace)]
-    return sorted(rows, key=lambda r: (r["seconds"] is None, r["at_s"] + (r["seconds"] or 0)))
+             "thread": e["thread"]} for e in done + running]
 
 # Cell 16: RunnableParallel (all signals at once; only intent calls the LLM)
 INTENTS = """wismo: where is my order, delivery status, delay

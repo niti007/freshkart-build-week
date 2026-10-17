@@ -1064,6 +1064,14 @@ def test_trace_table_sorting_and_running_rows(fake_bot):
     assert rows[1]["seconds"] == 0.84 and rows[2]["seconds"] is None and rows[2]["at_s"] == 0.85
     assert fake_bot.trace_table([]) == []
 
+def test_trace_table_uses_exact_end_times_for_ties(fake_bot):
+    from datetime import datetime, timedelta
+    t0 = datetime(2026, 10, 12, 20, 0, 0)
+    trace = [{"id": 1, "name": "router", "start": t0, "end": t0 + timedelta(seconds=1.3604), "thread": "MainThread"},
+             {"id": 2, "name": "decide_route", "start": t0 + timedelta(seconds=1.3601), "end": t0 + timedelta(seconds=1.3602),
+              "thread": "MainThread"}]
+    assert [r["station"] for r in fake_bot.trace_table(trace)] == ["decide_route", "router"]
+
 def test_ui_tracker_shows_stations_route_and_overlap(fake_bot):
     FAKE["delay"].update(intent=0.25, language=0.25)
     at = app()
