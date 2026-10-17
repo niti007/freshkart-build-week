@@ -46,3 +46,19 @@ Because of this fake, almost every acceptance test runs without an API key.
   - **Speed:** about the same, because the two calls already run in parallel.
   - **Risk:** with one prompt doing two jobs, a parse error loses both labels at once.
   - **Verdict:** under a ₹2-per-ticket budget, the combined call is the one to ship. Ex6's token counter can confirm the numbers.
+
+## Ex3: never-down intent (retry, backup model, safe default)
+
+- **Concepts:** `.with_retry(stop_after_attempt=3, retry_if_exception_type=RETRYABLE)`, `.with_fallbacks([backup])`, and a last-resort `RunnableLambda`. There is no `try/except` anywhere (a test checks this).
+  `safe_llm = retrying(main).with_fallbacks([retrying(backup)])` is used by the intent, language and lane chains. Each chain then has its own final fallback:
+  - intent → `"unclear"` (and `decide_route` sends `unclear` to `human_review`)
+  - language → `"english"`
+  - lanes → a fixed apology in the customer's language
+- **Which errors are retried:** only the ones that can succeed on a second try: timeout, connection error, 429 and 5xx. A wrong model name (404/400) or a bad key (401) never succeeds, so it goes straight to the backup model without wasting retries. `ChatOpenAI(max_retries=0)` turns off the SDK's hidden retries so ours are visible, and `timeout=20` makes a hung call fail instead of blocking forever.
+- **Which model answered:** the intent branch keeps the `AIMessage`, and a new station, `unpack_intent`, turns it into `intent` (still a plain string for `decide_route`) plus `intent_model`. *Why this answer?* shows "Intent answered by: …". This is the stretch, and it is also the proof for acceptance test 1.
+- **Acceptance tests (fake LLM):**
+  - With `MODEL=this/model-does-not-exist`, all 18 tickets still route correctly. Every intent is answered by the backup, every lane reply comes from the backup, and nothing is raised.
+  - With both models down (401 everywhere), every ticket gets `intent=unclear` and `human_review`, and the reply is the fixed apology, for both `invoke` and `stream`.
+  - With the normal setup, 18/18 still pass.
+- **Caveat found while building this:** `RunnableRetry` only wraps `invoke`/`batch`. The app *streams* the lanes, so a streamed lane never retries: it goes straight to the backup, then to the apology (`test_stream_does_not_retry_but_falls_back`). `with_fallbacks` also only helps if the error happens before the first token. A failure halfway through a stream still raises. For a short 2–3 sentence reply this is an acceptable risk.
+- `.env.example` now has `BACKUP_MODEL`. The `RETRY_WAIT` environment variable (default 0.5s) sets the backoff; the tests set it to 0.

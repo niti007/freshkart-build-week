@@ -33,10 +33,11 @@ INTENT_HINTS = [("Britannia bread missing", "missing_item"), ("ತಡವಾಗ�
 #   fail   model (or "*") -> an exception, or a list of exceptions raised one per call until empty
 #   script kind -> function(call) -> text, to override the canned answer
 #   delay  kind -> seconds to sleep (timing tests)
-FAKE = {"calls": [], "fail": {}, "script": {}, "delay": {}}
+#   init   kwargs of every ChatOpenAI(...) the bot built
+FAKE = {"calls": [], "fail": {}, "script": {}, "delay": {}, "init": []}
 
 def reset_fake():
-    FAKE.update(calls=[], fail={}, script={}, delay={})
+    FAKE.update(calls=[], fail={}, script={}, delay={}, init=[])
 
 def prompt_kind(system):
     if "Classify" in system: return "intent"
@@ -78,6 +79,7 @@ def fake_llm(prompt_value, model):
 
 def fake_chat_openai(**kw):
     """Stands in for ChatOpenAI. A RunnableSequence (not a bare RunnableLambda) so it has configurable_alternatives."""
+    FAKE["init"].append(kw)
     model = kw.get("model")
     return RunnablePassthrough() | RunnableLambda(lambda pv: fake_llm(pv, model))
 
@@ -98,6 +100,7 @@ def load_bot(monkeypatch, fake):
     if fake:
         monkeypatch.setattr(langchain_openai, "ChatOpenAI", fake_chat_openai)
         monkeypatch.setenv("OPENROUTER_API_KEY", os.getenv("OPENROUTER_API_KEY", "test-key"))
+        monkeypatch.setenv("RETRY_WAIT", "0")
     sys.modules.pop("bot", None)
     return importlib.import_module("bot")
 
@@ -464,6 +467,153 @@ def test_live_x3_telugu_reply(real_bot):
 @live
 def test_live_t01_hinglish(real_bot):
     assert decide(real_bot, BY_ID["T01"]["message"])["signals"]["language"] == "hinglish"
+
+# ---- Ex3: retry + fallback model + safe default ----
+MAIN, BACKUP, BROKEN = "openai/gpt-4o-mini", "meta-llama/llama-3.1-8b-instruct", "this/model-does-not-exist"
+
+def boom(error):
+    """A scripted answer that fails: lets one prompt kind fail while the others work."""
+    def fail(call): raise error()
+    return fail
+
+@pytest.fixture
+def broken_main_bot(monkeypatch):
+    """.env has MODEL=this/model-does-not-exist (OpenRouter answers 404)."""
+    monkeypatch.setenv("MODEL", BROKEN)
+    bot = load_bot(monkeypatch, fake=True)
+    FAKE["fail"][BROKEN] = not_found_error()
+    yield bot
+    sys.modules.pop("bot", None)
+
+def test_llms_built_without_sdk_retries_and_with_timeout(fake_bot):
+    assert {kw["model"] for kw in FAKE["init"]} == {MAIN, BACKUP}
+    assert all(kw["max_retries"] == 0 and kw["timeout"] == 20 for kw in FAKE["init"])
+
+def test_backup_model_from_env(monkeypatch):
+    monkeypatch.setenv("BACKUP_MODEL", "some/other-model")
+    load_bot(monkeypatch, fake=True)
+    assert "some/other-model" in {kw["model"] for kw in FAKE["init"]}
+    sys.modules.pop("bot", None)
+
+@pytest.mark.parametrize("errors", [
+    [timeout_error, timeout_error], [server_error], [lambda: status_error(openai.RateLimitError, 429)],
+    [lambda: openai.APIConnectionError(request=REQ)],
+])
+def test_transient_errors_are_retried_on_main(fake_bot, errors):
+    FAKE["fail"][MAIN] = [e() for e in errors]
+    assert fake_bot.safe_llm.invoke("Classify: hi").content.startswith("general")
+    assert [c["model"] for c in calls()] == [MAIN] * (len(errors) + 1)
+
+def test_retries_exhausted_then_backup(fake_bot):
+    FAKE["fail"][MAIN] = [timeout_error() for _ in range(3)]
+    out = fake_bot.safe_llm.invoke("Classify: hi")
+    assert [c["model"] for c in calls()] == [MAIN, MAIN, MAIN, BACKUP]
+    assert out.response_metadata["model_name"] == BACKUP
+
+@pytest.mark.parametrize("error", [not_found_error, auth_error, lambda: status_error(openai.BadRequestError, 400)])
+def test_permanent_errors_skip_retry_and_go_to_backup(fake_bot, error):
+    FAKE["fail"][MAIN] = error()
+    fake_bot.safe_llm.invoke("Classify: hi")
+    assert [c["model"] for c in calls()] == [MAIN, BACKUP]
+
+def test_safe_llm_raises_only_when_both_models_fail(fake_bot):
+    FAKE["fail"]["*"] = auth_error()
+    with pytest.raises(openai.AuthenticationError):
+        fake_bot.safe_llm.invoke("Classify: hi")
+
+def test_unpack_intent(fake_bot):
+    x = {"signals": {"intent_msg": AIMessage(content="food_safety,angry", response_metadata={"model_name": "m"}),
+                     "safety": True}}
+    s = fake_bot.unpack_intent(x)["signals"]
+    assert s == {"safety": True, "intent": "food_safety", "intent_model": "m"}
+
+def test_main_model_missing_all_18_still_answered_by_backup(broken_main_bot):
+    results = broken_main_bot.router.batch(inputs())
+    assert not wrong_routes(results)
+    assert {r["signals"]["intent_model"] for r in results} == {BACKUP}
+    for r in results:
+        assert broken_main_bot.reply_chain.invoke(r) == "Fake reply."
+    assert [c["model"] for c in calls("lane")] == [BROKEN, BACKUP] * 18  # main tried once (404: no retry), then backup
+
+def test_main_model_missing_stream_uses_backup(broken_main_bot):
+    d = decide(broken_main_bot, BY_ID["T01"]["message"])
+    assert "".join(broken_main_bot.reply_chain.stream(d)) == "Fake reply."
+
+def test_both_models_down_unclear_human_review_apology(fake_bot):
+    FAKE["fail"]["*"] = auth_error()
+    results = fake_bot.router.batch(inputs())
+    for r in results:
+        assert r["signals"]["intent"] == "unclear" and r["signals"]["intent_model"] == "none (AI down)"
+        assert r["signals"]["language"] == "english" and r["route"] == "human_review"
+        assert fake_bot.reply_chain.invoke(r) == fake_bot.APOLOGY["english"]
+    assert "".join(fake_bot.reply_chain.stream(results[0])) == fake_bot.APOLOGY["english"]
+
+def test_both_down_unclear_reason(fake_bot):
+    FAKE["fail"]["*"] = timeout_error()
+    d = decide(fake_bot, BY_ID["T01"]["message"])  # no safety words, no amount: the unclear rule decides
+    assert d["reasons"] == ["unclear intent"]
+
+def test_apology_in_customer_language(fake_bot):
+    FAKE["script"]["lane"] = boom(auth_error)
+    d = decide(fake_bot, X["X2"])
+    assert fake_bot.reply_chain.invoke(d) == fake_bot.APOLOGY["kannada"]
+    assert fake_bot.apology({"language": "other"}) == fake_bot.APOLOGY["english"]
+    assert fake_bot.apology({}) == fake_bot.APOLOGY["english"]
+
+def test_intent_falls_back_while_language_still_works(fake_bot):
+    FAKE["script"]["intent"] = boom(auth_error)
+    d = decide(fake_bot, X["X3"])
+    assert d["signals"]["intent"] == "unclear" and d["signals"]["language"] == "telugu" and d["route"] == "human_review"
+
+def test_stream_does_not_retry_but_falls_back(fake_bot):
+    d = decide(fake_bot, BY_ID["T01"]["message"])
+    FAKE["calls"].clear()
+    FAKE["fail"][MAIN] = [timeout_error()]
+    assert "".join(fake_bot.reply_chain.stream(d)) == "Fake reply."
+    assert [c["model"] for c in calls("lane")] == [MAIN, BACKUP]  # documented: RunnableRetry does not wrap .stream
+
+def test_invoke_retries_the_lane(fake_bot):
+    d = decide(fake_bot, BY_ID["T01"]["message"])
+    FAKE["calls"].clear()
+    FAKE["fail"][MAIN] = [timeout_error()]
+    assert fake_bot.reply_chain.invoke(d) == "Fake reply."
+    assert [c["model"] for c in calls("lane")] == [MAIN, MAIN]
+
+def test_no_try_except_in_bot():
+    src = (ROOT / "bot.py").read_text()
+    assert not re.search(r"^\s*(try:|except\b)", src, re.M)
+
+def test_ui_shows_backup_model(broken_main_bot):
+    at = app()
+    at.chat_input[0].set_value(BY_ID["T01"]["message"]).run()
+    assert not at.exception
+    assert any(f"Intent answered by: `{BACKUP}`" in md.value for md in at.expander[0].markdown)
+
+def test_ui_never_crashes_when_ai_is_down(fake_bot):
+    FAKE["fail"]["*"] = auth_error()
+    at = app()
+    at.chat_input[0].set_value(BY_ID["T01"]["message"]).run()
+    assert not at.exception
+    last = at.session_state["messages"][-1]
+    assert last["route"] == "human_review" and last["content"] == fake_bot.APOLOGY["english"]
+
+@live
+def test_live_bad_main_model_uses_backup(monkeypatch):
+    monkeypatch.setenv("MODEL", BROKEN)
+    bot = load_bot(monkeypatch, fake=False)
+    d = decide(bot, BY_ID["T01"]["message"])
+    assert "llama" in d["signals"]["intent_model"] and d["route"] == "auto_refund"
+    assert bot.reply_chain.invoke(d).strip()
+    sys.modules.pop("bot", None)
+
+@live
+def test_live_wrong_key_is_unclear_human_review_apology(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-wrong-key-for-this-test")
+    bot = load_bot(monkeypatch, fake=False)
+    d = decide(bot, BY_ID["T01"]["message"])
+    assert d["signals"]["intent"] == "unclear" and d["route"] == "human_review"
+    assert bot.reply_chain.invoke(d) == bot.APOLOGY["english"]
+    sys.modules.pop("bot", None)
 
 # ---- live (real OpenRouter calls) ----
 @live

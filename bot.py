@@ -1,11 +1,13 @@
 """FreshKart support bot: the notebook (freshkart_lcel.ipynb) moved into a .py file."""
 import os, re, sys
+import openai
 from pathlib import Path
 import pandas as pd
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser
+from langchain_core.messages import AIMessage
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough, RunnableParallel, RunnableBranch
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.chat_history import InMemoryChatMessageHistory
@@ -14,15 +16,29 @@ from langchain_core.chat_history import InMemoryChatMessageHistory
 load_dotenv()
 DATA = Path(__file__).parent / "data"
 
-def get_llm():
-    return ChatOpenAI(model=os.getenv("MODEL", "openai/gpt-4o-mini"),
+def get_llm(model=None):
+    # Ex 3: max_retries=0 so our own .with_retry is the one that retries; timeout so a hung call fails (and falls back).
+    return ChatOpenAI(model=model or os.getenv("MODEL", "openai/gpt-4o-mini"),
                       base_url="https://openrouter.ai/api/v1",
-                      api_key=os.getenv("OPENROUTER_API_KEY"), temperature=0)
+                      api_key=os.getenv("OPENROUTER_API_KEY"), temperature=0, max_retries=0, timeout=20)
 
 def read(name):
     return pd.read_csv(DATA / f"{name}.csv", dtype=str, keep_default_na=False)
 
 llm = get_llm()
+
+# Ex 3: never-down LLM (.with_retry + .with_fallbacks). Retry only errors that can succeed on a second try (timeout,
+# connection, 429, 5xx); a wrong model name (404) or a bad key (401) goes straight to the backup model.
+# Note: RunnableRetry only wraps invoke/batch. On .stream() (the lanes in the app) there is no retry, only fallbacks.
+BACKUP_MODEL = os.getenv("BACKUP_MODEL", "meta-llama/llama-3.1-8b-instruct")
+RETRYABLE = (openai.APITimeoutError, openai.APIConnectionError, openai.RateLimitError, openai.InternalServerError)
+RETRY_WAIT = float(os.getenv("RETRY_WAIT", "0.5"))  # seconds before the first retry (tests set 0)
+
+def retrying(model):
+    return model.with_retry(retry_if_exception_type=RETRYABLE, stop_after_attempt=3,
+                            exponential_jitter_params={"initial": RETRY_WAIT, "jitter": RETRY_WAIT})
+
+safe_llm = retrying(llm).with_fallbacks([retrying(get_llm(BACKUP_MODEL))])
 orders, customers, inventory, riders, tickets = [read(n) for n in
                                                  ["orders", "customers", "inventory", "riders", "tickets"]]
 TICKETS = tickets.to_dict("records")
@@ -135,10 +151,22 @@ def parse_language(text):
     words = re.findall(r"[a-z]+", text.lower())
     return words[0] if words and words[0] in LANGS else "english"
 
+def ai_down(text):
+    return AIMessage(content=text, response_metadata={"model_name": "none (AI down)"})
+
+def unpack_intent(x):
+    s = dict(x["signals"])
+    msg = s.pop("intent_msg")
+    s.update(intent=parse_intent(msg.content), intent_model=msg.response_metadata.get("model_name", "unknown"))
+    return {**x, "signals": s}
+
 oid = lambda f: RunnableLambda(lambda x: f(x["order_id"]))
 signals = RunnableParallel(
-    intent=masked | intent_prompt | llm | StrOutputParser() | RunnableLambda(parse_intent),
-    language=masked | language_prompt | llm | StrOutputParser() | RunnableLambda(parse_language),
+    # Ex 3: intent keeps the AIMessage (to record which model answered); unpack_intent parses it after the parallel step.
+    # Last fallback: "unclear", which decide_route already sends to human_review.
+    intent_msg=(masked | intent_prompt | safe_llm).with_fallbacks([RunnableLambda(lambda x: ai_down("unclear"))]),
+    language=(masked | language_prompt | safe_llm | StrOutputParser() | RunnableLambda(parse_language))
+             .with_fallbacks([RunnableLambda(lambda x: "english")]),
     order=oid(get_order), customer=oid(get_customer), inventory=oid(check_inventory), rider=oid(get_rider),
     safety=RunnableLambda(lambda x: has_safety(x["input"])),
     claimed_amount=RunnableLambda(lambda x: claimed_amount(x["input"])),
@@ -198,6 +226,15 @@ LANES = {
     "human_review": "Say a senior agent will contact them soon. Show care if it is about health, mention the Finance team for payments. Do not promise money.",
 }
 
+APOLOGY = {
+    "english": "Sorry, we're facing a technical issue. A FreshKart agent will contact you shortly.",
+    "hinglish": "Sorry, abhi technical issue aa raha hai. FreshKart agent aapse jaldi contact karega.",
+    "hindi": "क्षमा करें, अभी तकनीकी समस्या है। FreshKart एजेंट जल्द ही आपसे संपर्क करेगा।",
+    "kannada": "ಕ್ಷಮಿಸಿ, ತಾಂತ್ರಿಕ ಸಮಸ್ಯೆ ಇದೆ. FreshKart ಏಜೆಂಟ್ ಶೀಘ್ರದಲ್ಲೇ ನಿಮ್ಮನ್ನು ಸಂಪರ್ಕಿಸುತ್ತಾರೆ.",
+    "telugu": "క్షమించండి, సాంకేతిక సమస్య ఉంది. FreshKart ఏజెంట్ త్వరలో మిమ్మల్ని సంప్రదిస్తారు.",
+}
+def apology(x): return APOLOGY.get(x.get("language"), APOLOGY["english"])
+
 def lane(instruction):
     p = ChatPromptTemplate.from_messages([
         ("system", "You are a FreshKart support agent. Reply in 2-3 short sentences. Reply in {language} "
@@ -207,7 +244,8 @@ def lane(instruction):
         MessagesPlaceholder("chat_history"),
         ("human", "{masked_input}"),
     ])
-    return p | llm | StrOutputParser()
+    # Ex 3: if both models fail, the customer gets a fixed apology (in their language) instead of a crash.
+    return (p | safe_llm | StrOutputParser()).with_fallbacks([RunnableLambda(apology)])
 
 branch = RunnableBranch(
     *[(lambda x, name=name: x["route"] == name, lane(text)) for name, text in LANES.items() if name != "human_review"],
@@ -216,7 +254,7 @@ branch = RunnableBranch(
 
 # Cell 22: full chain + memory. The app uses router (decide) then reply_chain (stream) to avoid a 2nd intent call.
 router = (mask | RunnablePassthrough.assign(order_id=RunnableLambda(order_id_from))
-          | RunnablePassthrough.assign(signals=signals) | RunnableLambda(decide_route))
+          | RunnablePassthrough.assign(signals=signals) | RunnableLambda(unpack_intent) | RunnableLambda(decide_route))
 reply_chain = RunnableLambda(add_note) | branch
 full_chain = router | reply_chain
 

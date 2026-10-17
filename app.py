@@ -26,6 +26,7 @@ def why(m):
         st.markdown(f"Route: :{COLORS[m['route']]}[**{m['route']}**]")
         st.markdown("Reasons: " + "; ".join(m["reasons"]))
         st.markdown(f"Language: **{m['signals'].get('language', 'english')}**")
+        st.markdown(f"Intent answered by: `{m['signals'].get('intent_model', 'n/a')}`")
         if m.get("pii_count"):
             st.markdown(f":shield: PII masked: **{m['pii_count']} items** (before any prompt)")
         st.json(m["signals"])
@@ -96,6 +97,8 @@ with tab_how:
         |
  RunnablePassthrough.assign(signals = RunnableParallel(
         intent (LLM) | language (LLM, Ex2) | order | customer | inventory | rider | safety | claimed_amount ))
+        |
+ RunnableLambda(unpack_intent)        Ex3: intent + which model answered (retry -> backup model -> "unclear")
         |
  RunnableLambda(decide_route)         plain Python rules, no LLM
         |
