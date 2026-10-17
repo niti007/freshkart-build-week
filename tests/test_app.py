@@ -492,7 +492,7 @@ def broken_main_bot(monkeypatch):
     sys.modules.pop("bot", None)
 
 def test_llms_built_without_sdk_retries_and_with_timeout(fake_bot):
-    assert {kw["model"] for kw in FAKE["init"]} == {MAIN, BACKUP}
+    assert {kw["model"] for kw in FAKE["init"]} == {MAIN, BACKUP, "openai/gpt-4o"}
     assert all(kw["max_retries"] == 0 and kw["timeout"] == 20 for kw in FAKE["init"])
 
 def test_backup_model_from_env(monkeypatch):
@@ -593,7 +593,7 @@ def test_ui_shows_backup_model(broken_main_bot):
     at = app()
     at.chat_input[0].set_value(BY_ID["T01"]["message"]).run()
     assert not at.exception
-    assert any(f"Intent answered by: `{BACKUP}`" in md.value for md in at.expander[0].markdown)
+    assert any(f"intent answered by: `{BACKUP}`" in md.value for md in at.expander[0].markdown)
 
 def test_ui_never_crashes_when_ai_is_down(fake_bot):
     FAKE["fail"]["*"] = auth_error()
@@ -849,6 +849,110 @@ def test_live_bulk_triage_18_and_speed(real_bot):
     print(f"\nfor-loop {loop:.1f}s vs batch {batch:.1f}s")
     assert [r["route"] for r in rows[:18]] == [t["expected_route"] for t in TICKETS] and rows[18]["route"] == "error"
     assert batch * 2 <= loop
+
+# ---- Ex6: model switcher ----
+STRONG = "openai/gpt-4o"
+MODEL_OF = {"mini": MAIN, "llama": BACKUP, "strong": STRONG}
+
+def cfg(key): return {"configurable": {"model": key}}
+
+@pytest.mark.parametrize("key", ["mini", "llama", "strong"])
+def test_same_router_object_switches_model(fake_bot, key):
+    router_before = fake_bot.router
+    results = fake_bot.router.batch(inputs(), config=cfg(key))
+    assert fake_bot.router is router_before and not wrong_routes(results)
+    assert {c["model"] for c in calls()} == {MODEL_OF[key]}
+    assert {r["signals"]["intent_model"] for r in results} == {MODEL_OF[key]}
+
+def test_default_model_is_mini(fake_bot):
+    decide(fake_bot, BY_ID["T01"]["message"])
+    assert {c["model"] for c in calls()} == {MAIN}
+
+def test_switch_reaches_lanes_and_card_on_invoke_and_stream(fake_bot):
+    d = fake_bot.router.invoke(inputs([BY_ID["T09"]])[0], config=cfg("strong"))
+    fake_bot.reply_chain.invoke(d, config=cfg("strong"))
+    list(fake_bot.reply_chain.stream(d, config=cfg("llama")))
+    by_kind = {k: [c["model"] for c in calls(k)] for k in ("intent", "language", "lane", "card")}
+    assert by_kind == {"intent": [STRONG], "language": [STRONG], "lane": [STRONG, BACKUP], "card": [STRONG, BACKUP]}
+
+def test_switch_survives_retry_and_fallback_wrappers(fake_bot):
+    FAKE["fail"][STRONG] = not_found_error()
+    d = fake_bot.router.invoke(inputs([BY_ID["T01"]])[0], config=cfg("strong"))
+    assert d["signals"]["intent_model"] == BACKUP and d["route"] == "auto_refund"  # strong tried, then Ex3 backup
+    assert [c["model"] for c in calls("intent")] == [STRONG, BACKUP]
+
+def test_unknown_model_key_degrades_safely(fake_bot):
+    # configurable_alternatives raises ValueError for an unknown key; Ex3's backup model (not configurable) answers
+    d = fake_bot.router.invoke(inputs([BY_ID["T01"]])[0], config=cfg("gpt-99"))
+    assert d["signals"]["intent_model"] == BACKUP and d["route"] == "auto_refund"
+    assert {c["model"] for c in calls()} == {BACKUP}
+
+def test_bulk_triage_respects_model_choice(fake_bot):
+    fake_bot.bulk_triage.invoke(TICKETS[:3], config=cfg("llama"))
+    assert {c["model"] for c in calls()} == {BACKUP}
+
+@pytest.mark.parametrize("intent", ["missing_item", "general", "refund_status", "coupon_pass", "wismo", "unclear",
+                                    "damaged_spoiled", "expired", "food_safety", "payment_issue"])
+@pytest.mark.parametrize("key", ["mini", "llama", "strong"])
+def test_t18_vip_2000_is_human_review_whatever_the_model_says(fake_bot, key, intent):
+    FAKE["script"]["intent"] = lambda call: intent + ",angry"
+    d = fake_bot.router.invoke(inputs([BY_ID["T18"]])[0], config=cfg(key))
+    assert d["route"] == "human_review" and d["signals"]["claimed_amount"] == 2000.0
+
+def test_evaluate_scores_each_model(fake_bot):
+    rows = fake_bot.evaluate.batch(["mini", "llama", "strong"], config={"max_concurrency": 1})
+    assert [(r["model"], r["model_name"], r["score"], r["of"]) for r in rows] == [
+        ("mini", MAIN, 18, 18), ("llama", BACKUP, 18, 18), ("strong", STRONG, 18, 18)]
+    assert [r["answered_by"] for r in rows] == [MAIN, BACKUP, STRONG]
+    assert all(r["seconds"] >= 0 and r["tokens"] == 0 for r in rows)  # the fake is not a chat model: no usage callback
+
+def test_evaluate_counts_wrong_routes(fake_bot):
+    FAKE["script"]["intent"] = lambda call: "general,neutral"
+    assert fake_bot.evaluate.invoke("llama")["score"] < 18
+
+@pytest.mark.parametrize("usage,expected", [
+    ({"openai/gpt-4o-mini": {"input_tokens": 1_000_000, "output_tokens": 0}}, 0.15 * 88),
+    ({"openai/gpt-4o-mini-2024-07-18": {"input_tokens": 0, "output_tokens": 1_000_000}}, 0.60 * 88),
+    ({"openai/gpt-4o": {"input_tokens": 1_000_000, "output_tokens": 1_000_000}}, 12.5 * 88),
+    ({"meta-llama/llama-3.1-8b-instruct": {"input_tokens": 500_000, "output_tokens": 0}}, 0.01 * 88),
+    ({"unknown/model": {"input_tokens": 10, "output_tokens": 10}}, 0.0),
+])
+def test_rupees_uses_longest_matching_price(fake_bot, usage, expected):
+    assert fake_bot.rupees(usage) == pytest.approx(expected)
+
+def test_ui_model_select_and_memory_across_switch(fake_bot):
+    at = app()
+    at.sidebar.selectbox[0].set_value("llama").run()
+    at.chat_input[0].set_value(BY_ID["T01"]["message"]).run()
+    assert at.session_state["messages"][1]["model"] == "llama"
+    assert {c["model"] for c in calls()} == {BACKUP}
+    FAKE["calls"].clear()
+    at.sidebar.selectbox[0].set_value("strong").run()
+    at.chat_input[0].set_value("refund kab milega?").run()
+    assert not at.exception
+    last = at.session_state["messages"][-1]
+    assert last["model"] == "strong" and {c["model"] for c in calls()} == {STRONG}
+    assert at.session_state["log"][-1]["order_id"] == "FK1001"  # memory kept: order id from the earlier turn
+    assert any("Model chosen: `strong`" in md.value for md in at.expander[-1].markdown)
+
+def test_ui_compare_models_button(fake_bot):
+    at = app()
+    next(b for b in at.button if b.label == "Compare models").click().run()
+    assert not at.exception
+    table = at.session_state["compare"]
+    assert table["model"].tolist() == ["mini", "llama", "strong"] and (table["score"] == 18).all()
+
+@live
+def test_live_compare_mini_and_llama(real_bot):
+    rows = real_bot.evaluate.batch(["mini", "llama"], config={"max_concurrency": 1})
+    for r in rows:
+        print(f"\n{r['model']:6} {r['score']}/18 {r['seconds']}s {r['tokens']} tokens ~Rs{r['rs_per_ticket']}/ticket")
+        assert r["score"] >= 15 and r["tokens"] > 0
+
+@live
+def test_live_t18_both_models(real_bot):
+    for key in ["mini", "llama"]:
+        assert real_bot.router.invoke(inputs([BY_ID["T18"]])[0], config=cfg(key))["route"] == "human_review"
 
 # ---- live (real OpenRouter calls) ----
 @live

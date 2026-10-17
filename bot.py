@@ -1,5 +1,5 @@
 """FreshKart support bot: the notebook (freshkart_lcel.ipynb) moved into a .py file."""
-import os, re, sys
+import os, re, sys, time
 import openai
 from pathlib import Path
 import pandas as pd
@@ -8,7 +8,8 @@ from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain_core.messages import AIMessage
-from langchain_core.runnables import RunnableLambda, RunnablePassthrough, RunnableParallel, RunnableBranch
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough, RunnableParallel, RunnableBranch, ConfigurableField
+from langchain_core.callbacks import UsageMetadataCallbackHandler
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.chat_history import InMemoryChatMessageHistory
 
@@ -25,7 +26,15 @@ def get_llm(model=None):
 def read(name):
     return pd.read_csv(DATA / f"{name}.csv", dtype=str, keep_default_na=False)
 
-llm = get_llm()
+# Ex 6: model switcher at runtime (configurable_alternatives). ONE llm object whose model is picked per request with
+# config={"configurable": {"model": "llama"}}. Every chain built on llm (intent, language, lanes, card, Ex3's retry and
+# fallback wrappers) gets the switch for free: config travels down to every child Runnable on each call, and only the
+# alternative chosen by the config is called. No chain is rebuilt.
+MODELS = {"mini": os.getenv("MODEL", "openai/gpt-4o-mini"), "llama": "meta-llama/llama-3.1-8b-instruct",
+          "strong": "openai/gpt-4o"}
+llm = get_llm(MODELS["mini"]).configurable_alternatives(
+    ConfigurableField(id="model", name="Model"), default_key="mini",
+    **{key: get_llm(name) for key, name in MODELS.items() if key != "mini"})
 
 # Ex 3: never-down LLM (.with_retry + .with_fallbacks). Retry only errors that can succeed on a second try (timeout,
 # connection, 429, 5xx); a wrong model name (404) or a bad key (401) goes straight to the backup model.
@@ -324,6 +333,35 @@ def to_rows(x):
 
 bulk_triage = (RunnableLambda(lambda rows: {"rows": rows}) | RunnablePassthrough.assign(results=RunnableLambda(run_batch))
                | RunnableLambda(to_rows))
+
+# Ex 6: compare models on the 18 sample tickets with the SAME router object; only the config changes.
+# Tokens come from UsageMetadataCallbackHandler (routing calls only: intent + language). Prices are approximate
+# OpenRouter list prices in USD per 1M tokens (input, output); edit them if they change.
+PRICE_USD_PER_M = {"openai/gpt-4o-mini": (0.15, 0.60), "meta-llama/llama-3.1-8b-instruct": (0.02, 0.03),
+                   "openai/gpt-4o": (2.50, 10.00)}
+USD_INR = 88
+
+def rupees(usage):
+    total = 0.0
+    for name, u in usage.items():
+        price = next((PRICE_USD_PER_M[k] for k in sorted(PRICE_USD_PER_M, key=len, reverse=True) if name.startswith(k)), (0, 0))
+        total += (u.get("input_tokens", 0) * price[0] + u.get("output_tokens", 0) * price[1]) / 1e6 * USD_INR
+    return total
+
+def evaluate_model(key):
+    usage = UsageMetadataCallbackHandler()
+    t0 = time.perf_counter()
+    results = router.batch([{"input": t["message"], "chat_history": []} for t in TICKETS],
+                           config={"configurable": {"model": key}, "max_concurrency": 5, "callbacks": [usage]},
+                           return_exceptions=True)
+    ok = [not isinstance(r, Exception) and r["route"] == t["expected_route"] for r, t in zip(results, TICKETS)]
+    return {"model": key, "model_name": MODELS[key], "score": sum(ok), "of": len(TICKETS),
+            "seconds": round(time.perf_counter() - t0, 1),
+            "tokens": sum(u.get("total_tokens", 0) for u in usage.usage_metadata.values()),
+            "rs_per_ticket": round(rupees(usage.usage_metadata) / len(TICKETS), 4),
+            "answered_by": ", ".join(sorted({r["signals"]["intent_model"] for r in results if not isinstance(r, Exception)}))}
+
+evaluate = RunnableLambda(evaluate_model)
 
 store = {}
 def get_history(session_id):

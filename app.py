@@ -12,6 +12,7 @@ if not os.getenv("OPENROUTER_API_KEY"):
     st.error("OPENROUTER_API_KEY is missing. Copy .env.example to .env, add your key, and restart.")
     st.stop()
 from bot import (TICKETS, orders, customers, inventory, riders, router, reply_chain, get_history, bulk_triage,
+                 MODELS, evaluate,
                  get_order, get_customer, order_id_from)
 
 ss = st.session_state
@@ -26,7 +27,7 @@ def why(m):
         st.markdown(f"Route: :{COLORS[m['route']]}[**{m['route']}**]")
         st.markdown("Reasons: " + "; ".join(m["reasons"]))
         st.markdown(f"Language: **{m['signals'].get('language', 'english')}**")
-        st.markdown(f"Intent answered by: `{m['signals'].get('intent_model', 'n/a')}`")
+        st.markdown(f"Model chosen: `{m.get('model', 'mini')}` · intent answered by: `{m['signals'].get('intent_model', 'n/a')}`")
         if m.get("pii_count"):
             st.markdown(f":shield: PII masked: **{m['pii_count']} items** (before any prompt)")
         st.json(m["signals"])
@@ -45,6 +46,8 @@ sample = None
 with st.sidebar:
     st.header("About")
     st.write("Rules-based support bot: signals in parallel, routing in plain Python, then a streamed reply.")
+    model = st.selectbox("Model", list(MODELS), format_func=lambda k: f"{k} ({MODELS[k]})")
+    cfg = {"configurable": {"model": model}}  # Ex6: same chains, the model is picked per request
     choice = st.selectbox("Try a sample ticket", TICKETS, format_func=lambda t: f"{t['id']}: {' '.join(t['message'].split()[:6])}...")
     if st.button("Send"):
         sample = choice["message"]
@@ -66,13 +69,13 @@ with tab_chat:
         history = get_history(ss.sid)
         with st.chat_message("assistant"):
             with st.spinner("Checking order, customer and policy..."):
-                decision = router.invoke({"input": msg, "chat_history": history.messages})
+                decision = router.invoke({"input": msg, "chat_history": history.messages}, config=cfg)
             out = {}
-            reply = st.write_stream(reply_text(reply_chain.stream(decision), out))
+            reply = st.write_stream(reply_text(reply_chain.stream(decision, config=cfg), out))
             card = out.get("card")
             m = {"role": "assistant", "content": reply, "route": decision["route"],
                  "reasons": decision["reasons"], "signals": decision["signals"],
-                 "pii_count": decision["pii_count"], "card": card}
+                 "pii_count": decision["pii_count"], "card": card, "model": model}
             why(m)
         history.add_user_message(msg)
         history.add_ai_message(reply)
@@ -108,7 +111,7 @@ with tab_ops:
         rows = TICKETS
     if rows is not None:
         t0 = time.perf_counter()
-        result = pd.DataFrame(bulk_triage.invoke(rows))
+        result = pd.DataFrame(bulk_triage.invoke(rows, config=cfg))
         ss.bulk = {"result": result, "seconds": time.perf_counter() - t0,
                    "expected": [r.get("expected_route") for r in rows]}
     if "bulk" in ss:
@@ -119,6 +122,13 @@ with tab_ops:
         st.dataframe(result.route.value_counts().rename("tickets"))
         st.dataframe(result, use_container_width=True)
 
+    st.subheader("Compare models (18 sample tickets, routing only)")
+    if st.button("Compare models"):
+        # one model at a time, so the timings do not disturb each other
+        ss.compare = pd.DataFrame(evaluate.batch(list(MODELS), config={"max_concurrency": 1}))
+    if "compare" in ss:
+        st.dataframe(ss.compare, use_container_width=True)
+
 with tab_data:
     for name, df in [("orders", orders), ("customers", customers), ("inventory", inventory), ("riders", riders)]:
         st.subheader(name)
@@ -126,7 +136,7 @@ with tab_data:
 
 with tab_how:
     st.code("""
- {input, chat_history}
+ {input, chat_history}   + config={"configurable": {"model": "mini" | "llama" | "strong"}}  (Ex6)
         |
  RunnablePassthrough.assign(masked_input, pii_count)   Ex1: mask phone/email/UPI/card for prompts
         |
