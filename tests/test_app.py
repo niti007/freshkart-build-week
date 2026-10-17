@@ -30,7 +30,7 @@ INTENT_HINTS = [("Britannia bread missing", "missing_item"), ("ತಡವಾಗ�
 # ---- fake LLM ----
 # One shared state dict, reset by the fixtures. Tests read and tweak it:
 #   calls  every LLM call: model, kind (intent/language/card/checker/lane), system, human, messages
-#   fail   model (or "*") -> an exception, or a list of exceptions raised one per call until empty
+#   fail   model (or "*") -> an error factory (fresh error per call), or a list of errors raised once each
 #   script kind -> function(call) -> text, to override the canned answer
 #   delay  kind -> seconds to sleep (timing tests)
 #   init   kwargs of every ChatOpenAI(...) the bot built
@@ -72,7 +72,8 @@ def fake_llm(prompt_value, model):
     time.sleep(FAKE["delay"].get(call["kind"], 0))
     err = FAKE["fail"].get(model, FAKE["fail"].get("*"))
     if isinstance(err, list) and err: raise err.pop(0)
-    if isinstance(err, Exception): raise err
+    if isinstance(err, Exception): raise err.with_traceback(None)
+    if callable(err): raise err()  # a factory: a fresh error per call, like a real API
     text = FAKE["script"].get(call["kind"], DEFAULTS[call["kind"]])(call)
     return AIMessage(content=text, response_metadata={"model_name": model},
                      usage_metadata={"input_tokens": 100, "output_tokens": 10, "total_tokens": 110})
@@ -155,7 +156,7 @@ def test_fake_failure_injection_list_then_success():
 
 def test_fake_failure_by_model_and_wildcard():
     reset_fake()
-    FAKE["fail"]["*"] = auth_error()
+    FAKE["fail"]["*"] = auth_error
     with pytest.raises(openai.AuthenticationError): fake_chat_openai(model="any").invoke("hi")
     FAKE["fail"]["ok"] = None
     assert fake_chat_openai(model="ok").invoke("hi").content == "Fake reply."
@@ -487,7 +488,7 @@ def broken_main_bot(monkeypatch):
     """.env has MODEL=this/model-does-not-exist (OpenRouter answers 404)."""
     monkeypatch.setenv("MODEL", BROKEN)
     bot = load_bot(monkeypatch, fake=True)
-    FAKE["fail"][BROKEN] = not_found_error()
+    FAKE["fail"][BROKEN] = not_found_error
     yield bot
     sys.modules.pop("bot", None)
 
@@ -518,12 +519,12 @@ def test_retries_exhausted_then_backup(fake_bot):
 
 @pytest.mark.parametrize("error", [not_found_error, auth_error, lambda: status_error(openai.BadRequestError, 400)])
 def test_permanent_errors_skip_retry_and_go_to_backup(fake_bot, error):
-    FAKE["fail"][MAIN] = error()
+    FAKE["fail"][MAIN] = error
     fake_bot.safe_llm.invoke("Classify: hi")
     assert [c["model"] for c in calls()] == [MAIN, BACKUP]
 
 def test_safe_llm_raises_only_when_both_models_fail(fake_bot):
-    FAKE["fail"]["*"] = auth_error()
+    FAKE["fail"]["*"] = auth_error
     with pytest.raises(openai.AuthenticationError):
         fake_bot.safe_llm.invoke("Classify: hi")
 
@@ -546,7 +547,7 @@ def test_main_model_missing_stream_uses_backup(broken_main_bot):
     assert streamed(broken_main_bot, d) == "Fake reply."
 
 def test_both_models_down_unclear_human_review_apology(fake_bot):
-    FAKE["fail"]["*"] = auth_error()
+    FAKE["fail"]["*"] = auth_error
     results = fake_bot.router.batch(inputs())
     for r in results:
         assert r["signals"]["intent"] == "unclear" and r["signals"]["intent_model"] == "none (AI down)"
@@ -555,7 +556,7 @@ def test_both_models_down_unclear_human_review_apology(fake_bot):
     assert streamed(fake_bot, results[0]) == fake_bot.APOLOGY["english"]
 
 def test_both_down_unclear_reason(fake_bot):
-    FAKE["fail"]["*"] = timeout_error()
+    FAKE["fail"]["*"] = timeout_error
     d = decide(fake_bot, BY_ID["T01"]["message"])  # no safety words, no amount: the unclear rule decides
     assert d["reasons"] == ["unclear intent"]
 
@@ -596,7 +597,7 @@ def test_ui_shows_backup_model(broken_main_bot):
     assert any(f"intent answered by: `{BACKUP}`" in md.value for md in at.expander[0].markdown)
 
 def test_ui_never_crashes_when_ai_is_down(fake_bot):
-    FAKE["fail"]["*"] = auth_error()
+    FAKE["fail"]["*"] = auth_error
     at = app()
     at.chat_input[0].set_value(BY_ID["T01"]["message"]).run()
     assert not at.exception
@@ -876,7 +877,7 @@ def test_switch_reaches_lanes_and_card_on_invoke_and_stream(fake_bot):
     assert by_kind == {"intent": [STRONG], "language": [STRONG], "lane": [STRONG, BACKUP], "card": [STRONG, BACKUP]}
 
 def test_switch_survives_retry_and_fallback_wrappers(fake_bot):
-    FAKE["fail"][STRONG] = not_found_error()
+    FAKE["fail"][STRONG] = not_found_error
     d = fake_bot.router.invoke(inputs([BY_ID["T01"]])[0], config=cfg("strong"))
     assert d["signals"]["intent_model"] == BACKUP and d["route"] == "auto_refund"  # strong tried, then Ex3 backup
     assert [c["model"] for c in calls("intent")] == [STRONG, BACKUP]
@@ -953,6 +954,116 @@ def test_live_compare_mini_and_llama(real_bot):
 def test_live_t18_both_models(real_bot):
     for key in ["mini", "llama"]:
         assert real_bot.router.invoke(inputs([BY_ID["T18"]])[0], config=cfg(key))["route"] == "human_review"
+
+# ---- Ex7: live pipeline tracker ----
+ROUTER_STATIONS = {"router", "pii mask", "order id", "signals (parallel)", "unpack_intent", "decide_route"}
+
+def traced(bot, msg, trace, key="mini"):
+    config = {"configurable": {"model": key, "trace": trace}}
+    d = bot.router.invoke({"input": msg, "chat_history": []}, config=config)
+    list(bot.reply_chain.stream(d, config=config))
+    return d
+
+def by_name(trace): return {e["name"]: e for e in trace}
+
+def test_t09_trace_has_every_station_once(fake_bot):
+    trace = []
+    traced(fake_bot, BY_ID["T09"]["message"], trace)
+    names = [e["name"] for e in trace]
+    expected = set(fake_bot.SIGNAL_STATIONS) | ROUTER_STATIONS | {"lane: human_review", "hand-off card"}
+    assert set(names) == expected and len(names) == len(expected)
+    assert all(e["end"] is not None and e["end"] >= e["start"] for e in trace)
+
+def test_t01_trace_has_its_lane_and_no_card(fake_bot):
+    trace = []
+    traced(fake_bot, BY_ID["T01"]["message"], trace)
+    names = {e["name"] for e in trace}
+    assert "lane: auto_refund" in names and "hand-off card" not in names
+    assert not any(n.startswith("lane: ") and n != "lane: auto_refund" for n in names)
+
+def test_signal_times_add_up_to_more_than_router_total(fake_bot):
+    FAKE["delay"].update(intent=0.3, language=0.3)
+    trace = []
+    traced(fake_bot, BY_ID["T09"]["message"], trace)
+    rows = {r["station"]: r for r in fake_bot.trace_table(trace)}
+    signals_sum = sum(rows[s]["seconds"] for s in fake_bot.SIGNAL_STATIONS)
+    assert signals_sum >= 0.6 and rows["router"]["seconds"] < 0.5 and signals_sum > rows["router"]["seconds"]
+
+def test_parallel_stations_overlap(fake_bot):
+    FAKE["delay"].update(intent=0.3)
+    trace = []
+    traced(fake_bot, BY_ID["T09"]["message"], trace)
+    e = by_name(trace)
+    starts = [e[s]["start"] for s in fake_bot.SIGNAL_STATIONS]
+    assert (max(starts) - min(starts)).total_seconds() < 0.1          # all signals start together
+    assert e["order lookup"]["end"] < e["intent (LLM)"]["end"]          # lookups do not wait for the LLM
+    assert e["decide_route"]["start"] >= e["intent (LLM)"]["end"]       # decide_route waits for all signals
+
+def test_parallel_listeners_run_on_worker_threads(fake_bot):
+    trace = []
+    fake_bot.router.invoke({"input": BY_ID["T09"]["message"], "chat_history": []}, config={"configurable": {"trace": trace}})
+    e = by_name(trace)
+    signal_threads = {e[s]["thread"] for s in fake_bot.SIGNAL_STATIONS}
+    assert "MainThread" not in signal_threads and len(signal_threads) > 1
+    assert e["decide_route"]["thread"] == "MainThread"
+
+def test_tracker_off_records_nothing_and_changes_nothing(fake_bot):
+    with_trace, trace = [], []
+    for t in TICKETS:
+        with_trace.append(fake_bot.router.invoke({"input": t["message"], "chat_history": []},
+                                                 config={"configurable": {"trace": trace}}))
+    FAKE["calls"].clear()
+    without = fake_bot.router.batch(inputs())
+    assert not wrong_routes(without) and not wrong_routes(with_trace)
+    assert [r["route"] for r in without] == [r["route"] for r in with_trace]
+    from types import SimpleNamespace
+    fake_bot.on_start(SimpleNamespace(id=1, name="x", start_time=None), {})  # no trace in config: no error
+    fake_bot.on_end(SimpleNamespace(id=1, end_time=None), {"configurable": {}})
+
+def test_concurrent_requests_keep_separate_traces(fake_bot):
+    a, b = [], []
+    fake_bot.router.batch(inputs([BY_ID["T09"], BY_ID["T01"]]),
+                          config=[{"configurable": {"trace": a}}, {"configurable": {"trace": b}}])
+    assert sorted(e["name"] for e in a) == sorted(e["name"] for e in b)
+    assert len({e["id"] for e in a} & {e["id"] for e in b}) == 0
+
+def test_trace_table_sorting_and_running_rows(fake_bot):
+    from datetime import datetime, timedelta
+    t0 = datetime(2026, 10, 12, 20, 0, 0)
+    trace = [{"id": 1, "name": "intent (LLM)", "start": t0, "end": t0 + timedelta(seconds=0.84), "thread": "w1"},
+             {"id": 2, "name": "order lookup", "start": t0, "end": t0 + timedelta(seconds=0.01), "thread": "w2"},
+             {"id": 3, "name": "decide_route", "start": t0 + timedelta(seconds=0.85), "end": None, "thread": "MainThread"}]
+    rows = fake_bot.trace_table(trace)
+    assert [r["station"] for r in rows] == ["order lookup", "intent (LLM)", "decide_route"]
+    assert rows[1]["seconds"] == 0.84 and rows[2]["seconds"] is None and rows[2]["at_s"] == 0.85
+    assert fake_bot.trace_table([]) == []
+
+def test_ui_tracker_shows_stations_route_and_overlap(fake_bot):
+    FAKE["delay"].update(intent=0.25, language=0.25)
+    at = app()
+    at.chat_input[0].set_value(BY_ID["T09"]["message"]).run()
+    assert not at.exception
+    text = at.session_state["messages"][1]["trace"]
+    for station in ["intent (LLM)", "order lookup", "safety keywords", "decide_route", "lane: human_review"]:
+        assert f"✓ {station}" in text
+    assert "-> human_review (food safety)" in text and "they overlapped" in text
+    assert at.status[0].label == "Done: human_review"
+    assert any("Pipeline tracker" in md.value for md in at.expander[0].markdown)
+
+def test_ui_tracker_off(fake_bot):
+    at = app()
+    at.sidebar.toggle[0].set_value(False).run()
+    at.chat_input[0].set_value(BY_ID["T09"]["message"]).run()
+    assert not at.exception and len(at.status) == 0
+    m = at.session_state["messages"][1]
+    assert m["trace"] is None and m["route"] == "human_review" and m["content"] == "Fake reply."
+
+@live
+def test_live_t09_tracker(real_bot):
+    trace = []
+    traced(real_bot, BY_ID["T09"]["message"], trace)
+    rows = {r["station"]: r for r in real_bot.trace_table(trace)}
+    assert sum(rows[s]["seconds"] for s in real_bot.SIGNAL_STATIONS) > rows["router"]["seconds"]
 
 # ---- live (real OpenRouter calls) ----
 @live

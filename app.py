@@ -1,4 +1,5 @@
 import os, time, uuid
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 import pandas as pd
 import streamlit as st
@@ -12,7 +13,7 @@ if not os.getenv("OPENROUTER_API_KEY"):
     st.error("OPENROUTER_API_KEY is missing. Copy .env.example to .env, add your key, and restart.")
     st.stop()
 from bot import (TICKETS, orders, customers, inventory, riders, router, reply_chain, get_history, bulk_triage,
-                 MODELS, evaluate,
+                 MODELS, evaluate, SIGNAL_STATIONS, trace_table,
                  get_order, get_customer, order_id_from)
 
 ss = st.session_state
@@ -34,6 +35,34 @@ def why(m):
         if m.get("card"):
             st.markdown("**Hand-off card** (for the senior agent)")
             st.json(m["card"])
+        if m.get("trace"):
+            st.markdown("**Pipeline tracker**")
+            st.code(m["trace"], language="text")
+
+def tracker_text(trace, decision=None):
+    """Ex7 display only: one line per station from the list the pipeline's listeners filled."""
+    rows, lines = trace_table(trace), []
+    for r in rows:
+        if r["seconds"] is None:
+            lines.append(f"… {r['station']:<20} running")
+            continue
+        routed = f"  -> {decision['route']} ({'; '.join(decision['reasons'])})" if decision and r["station"] == "decide_route" else ""
+        lines.append(f"✓ {r['station']:<20} {r['seconds']:5.2f}s  at {r['at_s']:.2f}s{routed}")
+    total = next((r["seconds"] for r in rows if r["station"] == "router" and r["seconds"] is not None), None)
+    if total:
+        signals_sum = sum(r["seconds"] or 0 for r in rows if r["station"] in SIGNAL_STATIONS)
+        lines.append(f"sum of signal stations {signals_sum:.2f}s vs router total {total:.2f}s"
+                     + ("  (they overlapped: RunnableParallel)" if signals_sum > total else ""))
+    return "\n".join(lines)
+
+def run_tracked(fn, trace, box):
+    """Run the pipeline on a worker thread and redraw the tracker from Streamlit's thread until it is done."""
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        future = pool.submit(fn)
+        while not future.done():
+            box.code(tracker_text(trace), language="text")
+            time.sleep(0.1)
+    return future.result()
 
 def reply_text(chunks, out):
     """reply_chain streams {"reply": text} chunks and one {"card": ...} chunk: show the text, keep the card."""
@@ -48,6 +77,7 @@ with st.sidebar:
     st.write("Rules-based support bot: signals in parallel, routing in plain Python, then a streamed reply.")
     model = st.selectbox("Model", list(MODELS), format_func=lambda k: f"{k} ({MODELS[k]})")
     cfg = {"configurable": {"model": model}}  # Ex6: same chains, the model is picked per request
+    tracker_on = st.toggle("Live pipeline tracker", value=True)  # Ex7: off = no trace list, same pipeline
     choice = st.selectbox("Try a sample ticket", TICKETS, format_func=lambda t: f"{t['id']}: {' '.join(t['message'].split()[:6])}...")
     if st.button("Send"):
         sample = choice["message"]
@@ -68,14 +98,29 @@ with tab_chat:
             st.write(msg)
         history = get_history(ss.sid)
         with st.chat_message("assistant"):
-            with st.spinner("Checking order, customer and policy..."):
-                decision = router.invoke({"input": msg, "chat_history": history.messages}, config=cfg)
+            box = status = None
+            if tracker_on:
+                trace = []
+                run_cfg = {**cfg, "configurable": {**cfg["configurable"], "trace": trace}}
+                with st.status("Processing the ticket on the belt...", expanded=True) as status:
+                    box = st.empty()
+                    decision = run_tracked(lambda: router.invoke({"input": msg, "chat_history": history.messages},
+                                                                 config=run_cfg), trace, box)
+                    box.code(tracker_text(trace, decision) + "\n… writing reply", language="text")
+            else:
+                run_cfg = cfg
+                with st.spinner("Checking order, customer and policy..."):
+                    decision = router.invoke({"input": msg, "chat_history": history.messages}, config=cfg)
             out = {}
-            reply = st.write_stream(reply_text(reply_chain.stream(decision, config=cfg), out))
+            reply = st.write_stream(reply_text(reply_chain.stream(decision, config=run_cfg), out))
             card = out.get("card")
+            if tracker_on:
+                box.code(tracker_text(trace, decision), language="text")
+                status.update(label=f"Done: {decision['route']}", state="complete", expanded=False)
             m = {"role": "assistant", "content": reply, "route": decision["route"],
                  "reasons": decision["reasons"], "signals": decision["signals"],
-                 "pii_count": decision["pii_count"], "card": card, "model": model}
+                 "pii_count": decision["pii_count"], "card": card, "model": model,
+                 "trace": tracker_text(trace, decision) if tracker_on else None}
             why(m)
         history.add_user_message(msg)
         history.add_ai_message(reply)
@@ -148,6 +193,7 @@ with tab_how:
  RunnableLambda(unpack_intent)        Ex3: intent + which model answered (retry -> backup model -> "unclear")
         |
  RunnableLambda(decide_route)         plain Python rules, no LLM
+                                      (Ex7: every station is named and timed by listeners -> live tracker)
         |
  RunnableBranch: auto_refund | wismo | substitution | info | policy_decline | human_review
         |

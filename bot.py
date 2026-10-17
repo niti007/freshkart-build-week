@@ -1,5 +1,5 @@
 """FreshKart support bot: the notebook (freshkart_lcel.ipynb) moved into a .py file."""
-import os, re, sys, time
+import os, re, sys, threading, time
 import openai
 from pathlib import Path
 import pandas as pd
@@ -122,6 +122,41 @@ mask = RunnablePassthrough.assign(
 )
 masked = RunnableLambda(lambda x: {"input": x["masked_input"]})  # adapter: prompts read the masked text as {input}
 
+# Ex 7: live pipeline tracker. Every station gets a readable name (.with_config(run_name=...)) and listeners
+# (.with_listeners(on_start, on_end)) that append (name, start, end, thread) to a list the CALLER passes in
+# config={"configurable": {"trace": [...]}}. No trace list in the config = nothing recorded: the tracker is optional
+# and not part of the logic.
+# Why listeners and not astream_events: listeners get the run's real start_time/end_time. With astream_events every
+# step of a sequence "starts" at t=0 (it is waiting for its input), so decide_route would look as slow as the LLM.
+# Listeners also fire on .stream() (the lanes) and never surface a lane's draft tokens (the Bonus guard needs that).
+# Watch out: listeners of the RunnableParallel stations run on worker threads, so they only append to the list;
+# app.py polls that list from Streamlit's own thread and draws it (no st.* call in a listener).
+SIGNAL_STATIONS = ["intent (LLM)", "language (LLM)", "order lookup", "customer lookup", "inventory", "rider",
+                   "safety keywords", "claimed amount"]
+
+def on_start(run, config):
+    trace = config.get("configurable", {}).get("trace")
+    if trace is not None:
+        trace.append({"id": run.id, "name": run.name, "start": run.start_time, "end": None,
+                      "thread": threading.current_thread().name})
+
+def on_end(run, config):
+    trace = config.get("configurable", {}).get("trace")
+    for entry in trace if trace is not None else []:
+        if entry["id"] == run.id: entry["end"] = run.end_time
+
+def station(name, runnable):
+    return runnable.with_config(run_name=name).with_listeners(on_start=on_start, on_end=on_end)
+
+def trace_table(trace):
+    """Rows for display: seconds since the first station started, and how long each station took (None = running)."""
+    if not trace: return []
+    t0 = min(e["start"] for e in trace)
+    rows = [{"station": e["name"], "at_s": round((e["start"] - t0).total_seconds(), 2),
+             "seconds": round((e["end"] - e["start"]).total_seconds(), 2) if e["end"] else None,
+             "thread": e["thread"]} for e in list(trace)]
+    return sorted(rows, key=lambda r: (r["seconds"] is None, r["at_s"] + (r["seconds"] or 0)))
+
 # Cell 16: RunnableParallel (all signals at once; only intent calls the LLM)
 INTENTS = """wismo: where is my order, delivery status, delay
 missing_item: an item is not in the bag
@@ -173,12 +208,14 @@ oid = lambda f: RunnableLambda(lambda x: f(x["order_id"]))
 signals = RunnableParallel(
     # Ex 3: intent keeps the AIMessage (to record which model answered); unpack_intent parses it after the parallel step.
     # Last fallback: "unclear", which decide_route already sends to human_review.
-    intent_msg=(masked | intent_prompt | safe_llm).with_fallbacks([RunnableLambda(lambda x: ai_down("unclear"))]),
-    language=(masked | language_prompt | safe_llm | StrOutputParser() | RunnableLambda(parse_language))
-             .with_fallbacks([RunnableLambda(lambda x: "english")]),
-    order=oid(get_order), customer=oid(get_customer), inventory=oid(check_inventory), rider=oid(get_rider),
-    safety=RunnableLambda(lambda x: has_safety(x["input"])),
-    claimed_amount=RunnableLambda(lambda x: claimed_amount(x["input"])),
+    intent_msg=station("intent (LLM)", (masked | intent_prompt | safe_llm)
+                       .with_fallbacks([RunnableLambda(lambda x: ai_down("unclear"))])),
+    language=station("language (LLM)", (masked | language_prompt | safe_llm | StrOutputParser()
+                                        | RunnableLambda(parse_language)).with_fallbacks([RunnableLambda(lambda x: "english")])),
+    order=station("order lookup", oid(get_order)), customer=station("customer lookup", oid(get_customer)),
+    inventory=station("inventory", oid(check_inventory)), rider=station("rider", oid(get_rider)),
+    safety=station("safety keywords", RunnableLambda(lambda x: has_safety(x["input"]))),
+    claimed_amount=station("claimed amount", RunnableLambda(lambda x: claimed_amount(x["input"]))),
 )
 
 # Cell 18: decide_route (rules in plain Python, first match wins)
@@ -257,8 +294,9 @@ def lane(instruction):
     return (p | safe_llm | StrOutputParser()).with_fallbacks([RunnableLambda(apology)])
 
 branch = RunnableBranch(
-    *[(lambda x, name=name: x["route"] == name, lane(text)) for name, text in LANES.items() if name != "human_review"],
-    lane(LANES["human_review"]),
+    *[(lambda x, name=name: x["route"] == name, station(f"lane: {name}", lane(text)))
+      for name, text in LANES.items() if name != "human_review"],
+    station("lane: human_review", lane(LANES["human_review"])),
 )
 
 # Ex 4: ops hand-off card (RunnableParallel + prompt | llm | JsonOutputParser + RunnableBranch). Only human_review
@@ -299,11 +337,14 @@ def check_card(x):
 
 card_chain = (RunnablePassthrough.assign(raw=card_prompt | safe_llm | JsonOutputParser())
               | RunnableLambda(check_card)).with_fallbacks([RunnableLambda(default_card)])
-card_branch = RunnableBranch((lambda x: x["route"] == "human_review", card_chain), RunnableLambda(lambda x: None))
+card_branch = RunnableBranch((lambda x: x["route"] == "human_review", station("hand-off card", card_chain)),
+                             RunnableLambda(lambda x: None))
 
 # Cell 22: full chain + memory. The app uses router (decide) then reply_chain (stream) to avoid a 2nd intent call.
-router = (mask | RunnablePassthrough.assign(order_id=RunnableLambda(order_id_from))
-          | RunnablePassthrough.assign(signals=signals) | RunnableLambda(unpack_intent) | RunnableLambda(decide_route))
+router = station("router", station("pii mask", mask)
+                 | RunnablePassthrough.assign(order_id=station("order id", RunnableLambda(order_id_from)))
+                 | RunnablePassthrough.assign(signals=station("signals (parallel)", signals))
+                 | station("unpack_intent", RunnableLambda(unpack_intent)) | station("decide_route", RunnableLambda(decide_route)))
 reply_chain = RunnableLambda(add_note) | RunnableParallel(reply=branch, card=card_branch)  # Ex 4: {"reply", "card"}
 full_chain = router | reply_chain
 
