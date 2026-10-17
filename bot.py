@@ -131,7 +131,7 @@ masked = RunnableLambda(lambda x: {"input": x["masked_input"]})  # adapter: prom
 # Listeners also fire on .stream() (the lanes) and never surface a lane's draft tokens (the Bonus guard needs that).
 # Watch out: listeners of the RunnableParallel stations run on worker threads, so they only append to the list;
 # app.py polls that list from Streamlit's own thread and draws it (no st.* call in a listener).
-SIGNAL_STATIONS = ["intent (LLM)", "language (LLM)", "order lookup", "customer lookup", "inventory", "rider",
+SIGNAL_STATIONS = ["intent (LLM)", "language", "order lookup", "customer lookup", "inventory", "rider",
                    "safety keywords", "claimed amount"]
 
 def on_start(run, config):
@@ -185,11 +185,25 @@ def parse_intent(text):
 # time as intent (prompt | llm | StrOutputParser | RunnableLambda(clean_up)). The clean-up falls back to "english".
 LANGS = ["english", "hinglish", "hindi", "kannada", "telugu", "other"]
 language_prompt = ChatPromptTemplate.from_messages([
-    ("system", "Which language is the customer message written in? Choose exactly one: " + ", ".join(LANGS) + ".\n"
-               "hinglish = Hindi words written in English letters, often mixed with English. hindi = Devanagari script.\n"
+    ("system", "Which language is the customer message written in? Look at the script first.\n"
+               "english: English in Latin letters. If there are no Hindi words, it is english.\n"
+               "hinglish: Hindi words written in Latin letters, often mixed with English (e.g. 'refund kar do')\n"
+               "hindi: Devanagari script (e.g. हिन्दी)\nkannada: Kannada script (e.g. ಕನ್ನಡ)\n"
+               "telugu: Telugu script (e.g. తెలుగు)\nother: any other language\n"
+               "Order ids like FK1003 and English loan words do not change the language.\n"
                "Answer ONLY with the label."),
     ("human", "{input}"),
 ])
+
+# Ex 2 (found in live tests): gpt-4o-mini labelled a Telugu ticket "hindi" every time. A message written in Kannada,
+# Telugu or Devanagari script is known for certain in plain Python, so the LLM is only asked about Latin-script text
+# (english vs hinglish), where it is good. Bonus: with the AI down, a Kannada customer still gets a Kannada apology.
+SCRIPTS = {"kannada": "[\u0C80-\u0CFF]", "telugu": "[\u0C00-\u0C7F]", "hindi": "[\u0900-\u097F]"}
+
+def script_language(text):
+    counts = {lang: len(re.findall(chars, text)) for lang, chars in SCRIPTS.items()}
+    lang = max(counts, key=counts.get)
+    return lang if counts[lang] else None
 
 def parse_language(text):
     words = re.findall(r"[a-z]+", text.lower())
@@ -210,8 +224,10 @@ signals = RunnableParallel(
     # Last fallback: "unclear", which decide_route already sends to human_review.
     intent_msg=station("intent (LLM)", (masked | intent_prompt | safe_llm)
                        .with_fallbacks([RunnableLambda(lambda x: ai_down("unclear"))])),
-    language=station("language (LLM)", (masked | language_prompt | safe_llm | StrOutputParser()
-                                        | RunnableLambda(parse_language)).with_fallbacks([RunnableLambda(lambda x: "english")])),
+    language=station("language", RunnableBranch(
+        (lambda x: script_language(x["masked_input"]), RunnableLambda(lambda x: script_language(x["masked_input"]))),
+        (masked | language_prompt | safe_llm | StrOutputParser() | RunnableLambda(parse_language))
+        .with_fallbacks([RunnableLambda(lambda x: "english")]))),
     order=station("order lookup", oid(get_order)), customer=station("customer lookup", oid(get_customer)),
     inventory=station("inventory", oid(check_inventory)), rider=station("rider", oid(get_rider)),
     safety=station("safety keywords", RunnableLambda(lambda x: has_safety(x["input"]))),
