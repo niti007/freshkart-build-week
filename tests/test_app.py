@@ -1,8 +1,9 @@
-import csv, importlib, os, sys
+import csv, importlib, os, re, sys, time
 from pathlib import Path
-import pytest
+import httpx, openai, pytest
 from dotenv import load_dotenv
-from langchain_core.runnables import RunnableLambda
+from langchain_core.messages import AIMessage, HumanMessage
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough, ConfigurableField
 from streamlit.testing.v1 import AppTest
 
 ROOT = Path(__file__).parent.parent
@@ -10,20 +11,97 @@ sys.path.insert(0, str(ROOT))
 load_dotenv(ROOT / ".env")
 HAS_KEY = bool(os.getenv("OPENROUTER_API_KEY"))
 TICKETS = list(csv.DictReader(open(ROOT / "data" / "tickets.csv", encoding="utf-8")))
+BY_ID = {t["id"]: t for t in TICKETS}
 BY_MSG = {t["message"]: t["expected_intent"] for t in TICKETS}
+live = pytest.mark.skipif(not HAS_KEY, reason="no OPENROUTER_API_KEY")
 
-def fake_llm(prompt_value):
-    """Stands in for the LLM: intent prompt -> expected intent, lane prompts -> a canned reply."""
-    msgs = prompt_value.to_messages()
-    if "Classify" in msgs[0].content:
-        return BY_MSG.get(msgs[-1].content, "general") + ",neutral"
-    return "Fake reply."
+# Extra test tickets from EXERCISES.md
+X = {
+    "X1": "Please call me on 98450 12345 or mail ravi.k@gmail.com, UPI ravi@okaxis. FK1001 mein Britannia bread missing tha, refund do.",
+    "X2": "FK1007 ಆರ್ಡರ್ ತುಂಬಾ ತಡವಾಗಿ ಬಂತು, ಯಾಕೆ?",
+    "X3": "FK1003 లో వచ్చిన పెరుగు ఎక్స్‌పైర్ అయిపోయింది, రీఫండ్ కావాలి",
+    "X4": "FK1009 ka khana kha ke bacche ko ulti ho rahi hai",
+    "X5": "",
+}
+# Messages that are not in tickets.csv (or arrive masked) are matched by a fragment.
+INTENT_HINTS = [("Britannia bread missing", "missing_item"), ("ತಡವಾಗಿ", "wismo"), ("ఎక్స్‌పైర్", "expired"),
+                ("ulti", "food_safety")]
+
+# ---- fake LLM ----
+# One shared state dict, reset by the fixtures. Tests read and tweak it:
+#   calls  every LLM call: model, kind (intent/language/card/checker/lane), system, human, messages
+#   fail   model (or "*") -> an error factory (fresh error per call), or a list of errors raised once each
+#   script kind -> function(call) -> text, to override the canned answer
+#   delay  kind -> seconds to sleep (timing tests)
+#   init   kwargs of every ChatOpenAI(...) the bot built
+FAKE = {"calls": [], "fail": {}, "script": {}, "delay": {}, "init": []}
+
+def reset_fake():
+    FAKE.update(calls=[], fail={}, script={}, delay={}, init=[])
+
+def prompt_kind(system):
+    if "Classify" in system: return "intent"
+    if "Which language" in system: return "language"
+    if "team, priority" in system: return "card"
+    if "Answer yes or no" in system: return "checker"
+    return "lane"
+
+def fake_intent(call):
+    human = call["human"]
+    if human in BY_MSG: return BY_MSG[human] + ",neutral"
+    return next((i for frag, i in INTENT_HINTS if frag in human), "general") + ",neutral"
+
+def fake_language(call):
+    """Answers like a real model would: by script, then by common Hinglish words."""
+    h = call["human"]
+    if re.search("[\u0C80-\u0CFF]", h): return "kannada"
+    if re.search("[\u0C00-\u0C7F]", h): return "telugu"
+    if re.search("[\u0900-\u097F]", h): return "hindi"
+    if re.search(r"(?i)\b(mein|ka|ke|ki|hai|tha|kar|nahi|do|chahiye|kab|bola|maine|aur|raha|gaya|mujhe)\b", h): return "hinglish"
+    return "english"
+
+DEFAULTS = {"intent": fake_intent, "lane": lambda call: "Fake reply.", "language": fake_language,
+            "card": lambda call: '{"team": "support", "priority": "P3", "summary_en": "Fake summary.", "next_step": "Fake step."}',
+            "checker": lambda call: "no"}
+
+def fake_llm(prompt_value, model):
+    msgs = prompt_value.to_messages() if hasattr(prompt_value, "to_messages") else [HumanMessage(content=prompt_value)]
+    call = {"model": model, "kind": prompt_kind(msgs[0].content), "system": msgs[0].content,
+            "human": msgs[-1].content, "messages": msgs}
+    FAKE["calls"].append(call)
+    time.sleep(FAKE["delay"].get(call["kind"], 0))
+    err = FAKE["fail"].get(model, FAKE["fail"].get("*"))
+    if isinstance(err, list) and err: raise err.pop(0)
+    if isinstance(err, Exception): raise err.with_traceback(None)
+    if callable(err): raise err()  # a factory: a fresh error per call, like a real API
+    text = FAKE["script"].get(call["kind"], DEFAULTS[call["kind"]])(call)
+    return AIMessage(content=text, response_metadata={"model_name": model},
+                     usage_metadata={"input_tokens": 100, "output_tokens": 10, "total_tokens": 110})
+
+def fake_chat_openai(**kw):
+    """Stands in for ChatOpenAI. A RunnableSequence (not a bare RunnableLambda) so it has configurable_alternatives."""
+    FAKE["init"].append(kw)
+    model = kw.get("model")
+    return RunnablePassthrough() | RunnableLambda(lambda pv: fake_llm(pv, model))
+
+def calls(kind=None):
+    return [c for c in FAKE["calls"] if kind is None or c["kind"] == kind]
+
+# openai errors the way the SDK raises them
+REQ = httpx.Request("POST", "https://openrouter.ai/api/v1/chat/completions")
+def status_error(cls, code): return cls(f"HTTP {code}", response=httpx.Response(code, request=REQ), body=None)
+def timeout_error(): return openai.APITimeoutError(request=REQ)
+def not_found_error(): return status_error(openai.NotFoundError, 404)
+def auth_error(): return status_error(openai.AuthenticationError, 401)
+def server_error(): return status_error(openai.InternalServerError, 500)
 
 def load_bot(monkeypatch, fake):
     import langchain_openai
+    reset_fake()
     if fake:
-        monkeypatch.setattr(langchain_openai, "ChatOpenAI", lambda **kw: RunnableLambda(fake_llm))
+        monkeypatch.setattr(langchain_openai, "ChatOpenAI", fake_chat_openai)
         monkeypatch.setenv("OPENROUTER_API_KEY", os.getenv("OPENROUTER_API_KEY", "test-key"))
+        monkeypatch.setenv("RETRY_WAIT", "0")
     sys.modules.pop("bot", None)
     return importlib.import_module("bot")
 
@@ -40,6 +118,117 @@ def real_bot(monkeypatch):
 def app():
     return AppTest.from_file(str(ROOT / "app.py"), default_timeout=60).run()
 
+def inputs(tickets=TICKETS):
+    return [{"input": t["message"], "chat_history": []} for t in tickets]
+
+def wrong_routes(results, tickets=TICKETS):
+    """The regression check used after every exercise: ids of tickets whose route is not the expected one."""
+    return [t["id"] for t, r in zip(tickets, results) if r["route"] != t["expected_route"]]
+
+def reply(bot, d):
+    return bot.reply_chain.invoke(d)["reply"]
+
+def streamed(bot, d):
+    return "".join(chunk.get("reply", "") for chunk in bot.reply_chain.stream(d))
+
+def decide(bot, msg, history=()):
+    return bot.router.invoke({"input": msg, "chat_history": list(history)})
+
+# ---- Phase 0: the fake LLM itself ----
+def test_fake_answers_every_ticket_intent(fake_bot):
+    for t in TICKETS:
+        decide(fake_bot, t["message"])
+    assert [c["human"] for c in calls("intent")] == [t["message"] for t in TICKETS]
+    assert all(c["model"] == "openai/gpt-4o-mini" for c in calls())
+
+def test_fake_returns_ai_message_with_metadata():
+    out = fake_chat_openai(model="m").invoke("Classify this")
+    assert isinstance(out, AIMessage)
+    assert out.response_metadata["model_name"] == "m" and out.usage_metadata["total_tokens"] == 110
+
+def test_fake_failure_injection_list_then_success():
+    reset_fake()
+    FAKE["fail"]["m"] = [timeout_error(), timeout_error()]
+    llm = fake_chat_openai(model="m")
+    for _ in range(2):
+        with pytest.raises(openai.APITimeoutError): llm.invoke("hi")
+    assert llm.invoke("hi").content == "Fake reply."
+
+def test_fake_failure_by_model_and_wildcard():
+    reset_fake()
+    FAKE["fail"]["*"] = auth_error
+    with pytest.raises(openai.AuthenticationError): fake_chat_openai(model="any").invoke("hi")
+    FAKE["fail"]["ok"] = None
+    assert fake_chat_openai(model="ok").invoke("hi").content == "Fake reply."
+
+def test_fake_supports_configurable_alternatives():
+    reset_fake()
+    llm = fake_chat_openai(model="a").configurable_alternatives(ConfigurableField(id="model"), default_key="a",
+                                                                  b=fake_chat_openai(model="b"))
+    llm.invoke("hi"); llm.invoke("hi", config={"configurable": {"model": "b"}})
+    assert [c["model"] for c in calls()] == ["a", "b"]
+
+def test_fake_script_and_delay():
+    reset_fake()
+    FAKE["script"]["lane"] = lambda call: "scripted"
+    FAKE["delay"]["lane"] = 0.05
+    t0 = time.perf_counter()
+    assert fake_chat_openai(model="m").invoke("hi").content == "scripted"
+    assert time.perf_counter() - t0 >= 0.05
+
+# ---- baseline: helpers and rules (regression net before any exercise) ----
+@pytest.mark.parametrize("text,oid", [
+    ("FK1001 mein bread", "FK1001"), ("fk1006 kab tak", "FK1006"), ("ord_1010 ka rider", "FK1010"),
+    ("order FK 1002 please", "FK1002"), ("Mera order abhi tak nahi aaya", None), ("FK12345", None),
+])
+def test_find_order_id(fake_bot, text, oid):
+    assert fake_bot.find_order_id(text) == oid
+
+@pytest.mark.parametrize("text,amount", [
+    ("₹520 twice debited", 520.0), ("Rs. 1,200 refund", 1200.0), ("INR 300", 300.0), ("Rs 50 and ₹2000", 2000.0),
+    ("no money here, FK1001", None),
+])
+def test_claimed_amount(fake_bot, text, amount):
+    assert fake_bot.claimed_amount(text) == amount
+
+@pytest.mark.parametrize("text,flag", [
+    ("meri beti ko ulti ho rahi hai", True), ("Possibly food poisoning", True), ("baby has a rash", True),
+    ("mould on bread", True), ("bread missing tha", False), ("rider was rude", False),
+])
+def test_has_safety(fake_bot, text, flag):
+    assert fake_bot.has_safety(text) is flag
+
+def test_lookups(fake_bot):
+    assert fake_bot.get_order("FK1001")["amount"] == "210"
+    assert fake_bot.get_order("FK9999") is None and fake_bot.get_customer("FK9999") is None
+    assert fake_bot.check_inventory("FK1003") == {"expired_confirmed": True, "baby": False}
+    assert fake_bot.check_inventory("FK1004")["baby"] is True
+    assert fake_bot.check_inventory(None) is None
+    assert fake_bot.get_rider("FK1014")["gps_delivered"] == "n"
+
+def test_order_id_prefers_current_message_then_latest_history(fake_bot):
+    hist = [HumanMessage(content="FK1001 ka status?"), AIMessage(content="ok"), HumanMessage(content="FK1016 bhi")]
+    assert fake_bot.order_id_from({"input": "FK1003 ka kya?", "chat_history": hist}) == "FK1003"
+    assert fake_bot.order_id_from({"input": "refund kab?", "chat_history": hist}) == "FK1016"
+    assert fake_bot.order_id_from({"input": "hello"}) is None
+
+def test_add_note_mentions_coupon_only_when_late(fake_bot):
+    late = fake_bot.add_note(decide(fake_bot, BY_ID["T07"]["message"]))["note"]
+    on_time = fake_bot.add_note(decide(fake_bot, BY_ID["T01"]["message"]))["note"]
+    assert "delay=23min" in late and "Rs 50 coupon" in late
+    assert "coupon" not in on_time and "order=FK1001" in on_time
+
+def test_router_output_shape(fake_bot):
+    d = decide(fake_bot, BY_ID["T01"]["message"])
+    assert {"input", "chat_history", "order_id", "signals", "route", "reasons"} <= set(d)
+    assert set(d["signals"]) >= {"intent", "order", "customer", "inventory", "rider", "safety", "claimed_amount"}
+
+@pytest.mark.parametrize("tid", [t["id"] for t in TICKETS])
+def test_each_route_uses_its_lane(fake_bot, tid):
+    d = decide(fake_bot, BY_ID[tid]["message"])
+    assert reply(fake_bot, d) == "Fake reply."
+    assert fake_bot.LANES[d["route"]] in calls("lane")[-1]["system"]
+
 # ---- offline: rules and router ----
 CLEAN = {"customer_id": "C01", "fraud_score": "0.05", "refunds_30d": "0"}
 BASE = {"intent": "missing_item",
@@ -55,17 +244,25 @@ BASE = {"intent": "missing_item",
     ({"intent": "general"}, "info"),
     ({"order": None}, "info"),
     ({"intent": "mystery"}, "human_review"),
+    ({"intent": "unclear"}, "human_review"),
+    ({"intent": "payment_issue"}, "human_review"),
+    ({"intent": "rider_misconduct"}, "human_review"),
+    ({"rider": {"gps_delivered": "n"}}, "human_review"),
+    ({"customer": {**CLEAN, "fraud_score": "0.9"}}, "human_review"),
+    ({"order": {**BASE["order"], "status": "packing"}}, "policy_decline"),
+    ({"order": {**BASE["order"], "delivered_at": "2026-10-09 10:00"}}, "policy_decline"),
+    ({"intent": "expired"}, "policy_decline"),
+    ({"intent": "wrong_item_substitution", "order": {**BASE["order"], "substituted": "y"}}, "substitution"),
+    ({"claimed_amount": 500.0}, "human_review"),
 ])
 def test_decide_route(fake_bot, change, route):
     assert fake_bot.decide_route({"signals": {**BASE, **change}})["route"] == route
 
 def test_router_all_18_tickets(fake_bot):
-    results = fake_bot.router.batch([{"input": t["message"], "chat_history": []} for t in TICKETS])
-    wrong = [t["id"] for t, r in zip(TICKETS, results) if r["route"] != t["expected_route"]]
-    assert len(TICKETS) == 18 and not wrong, wrong
+    results = fake_bot.router.batch(inputs())
+    assert len(TICKETS) == 18 and not wrong_routes(results), wrong_routes(results)
 
 def test_memory_recovers_order_id(fake_bot):
-    from langchain_core.messages import HumanMessage
     x = {"input": "refund kab milega?", "chat_history": [HumanMessage(content="FK1016 ka status?")]}
     assert fake_bot.order_id_from(x) == "FK1016"
 
@@ -106,8 +303,926 @@ def test_missing_key_shows_error(monkeypatch, fake_bot):
     at = app()
     assert at.error and "OPENROUTER_API_KEY" in at.error[0].value
 
+# ---- Ex1: PII shield ----
+PII_RAW = ["98450 12345", "ravi.k@gmail.com", "ravi@okaxis"]
+
+@pytest.mark.parametrize("text,masked,count", [
+    (X["X1"], "Please call me on [PHONE] or mail [EMAIL], UPI [UPI]. FK1001 mein Britannia bread missing tha, refund do.", 3),
+    ("call +91 98450 12345 now", "call [PHONE] now", 1),
+    ("call +91-9845012345", "call [PHONE]", 1),
+    ("my number is 9845012345.", "my number is [PHONE].", 1),
+    ("card 4111 1111 1111 1111 please", "card [CARD] please", 1),
+    ("card 4111-1111-1111-1111", "card [CARD]", 1),
+    ("card 6011111111111117", "card [CARD]", 1),
+    ("aadhaar-like 1234 5678 9012", "aadhaar-like [CARD]", 1),
+    ("mail me at first.last+fk@mail.co.in.", "mail me at [EMAIL].", 1),
+    ("pay to 9845012345@paytm", "pay to [UPI]", 1),
+    ("upi: name.k@ybl", "upi: [UPI]", 1),
+    (BY_ID["T13"]["message"], BY_ID["T13"]["message"], 0),
+    ("FK1001 ord_1010 FK 1002 ₹520 Rs. 1,200 INR 300", "FK1001 ord_1010 FK 1002 ₹520 Rs. 1,200 INR 300", 0),
+    ("delivered 2026-10-12 18:40, 38 min late, 11 Oct", "delivered 2026-10-12 18:40, 38 min late, 11 Oct", 0),
+    ("short 12345 and 98450", "short 12345 and 98450", 0),
+    ("", "", 0),
+])
+def test_mask_pii(fake_bot, text, masked, count):
+    assert fake_bot.mask_pii(text) == (masked, count)
+
+def test_x1_intent_prompt_is_masked_but_routing_unchanged(fake_bot):
+    d = decide(fake_bot, X["X1"])
+    seen = calls("intent")[-1]["human"]
+    assert "[PHONE]" in seen and "[EMAIL]" in seen and "[UPI]" in seen and "FK1001" in seen
+    assert not any(p in seen for p in PII_RAW)
+    assert d["order_id"] == "FK1001" and d["route"] == "auto_refund"
+    assert d["input"] == X["X1"] and d["pii_count"] == 3
+
+def test_x1_intent_prompt_text_via_to_string(fake_bot):
+    d = fake_bot.mask.invoke({"input": X["X1"], "chat_history": []})
+    shown = fake_bot.intent_prompt.invoke(fake_bot.masked.invoke(d)).to_string()
+    assert "[PHONE]" in shown and "98450" not in shown
+
+def test_no_llm_call_ever_sees_raw_pii(fake_bot):
+    d = decide(fake_bot, X["X1"])
+    reply(fake_bot, d)
+    text = " ".join(m.content for c in calls() for m in c["messages"])
+    assert calls("lane") and not any(p in text for p in PII_RAW)
+
+def test_lane_prompt_reads_masked_input(fake_bot):
+    reply(fake_bot, decide(fake_bot, X["X1"]))
+    assert calls("lane")[-1]["human"].startswith("Please call me on [PHONE]")
+
+def test_history_is_masked_but_order_id_still_recovered(fake_bot):
+    hist = [HumanMessage(content="FK1016 ka refund? call 9845012345"), AIMessage(content="Checking.")]
+    d = decide(fake_bot, "refund kab milega?", hist)
+    assert d["order_id"] == "FK1016"
+    assert "9845012345" not in d["chat_history"][0].content and "[PHONE]" in d["chat_history"][0].content
+    reply(fake_bot, d)
+    assert "9845012345" not in " ".join(m.content for m in calls("lane")[-1]["messages"])
+    assert hist[0].content.endswith("9845012345")  # the caller's history object is not modified
+
+def test_t13_amount_not_masked(fake_bot):
+    d = decide(fake_bot, BY_ID["T13"]["message"])
+    assert d["signals"]["claimed_amount"] == 520.0 and d["masked_input"] == d["input"] and d["pii_count"] == 0
+
+def test_regex_signals_read_original_input(fake_bot):
+    d = decide(fake_bot, "FK1001 bread missing, ₹1500 refund do. Call 9845012345, bacche ko ulti ho rahi hai")
+    assert d["signals"]["claimed_amount"] == 1500.0 and d["signals"]["safety"] is True
+    assert d["route"] == "human_review"
+
+def test_ui_shows_pii_badge(fake_bot):
+    at = app()
+    at.chat_input[0].set_value(X["X1"]).run()
+    assert not at.exception
+    assert any("PII masked: **3 items**" in md.value for md in at.expander[0].markdown)
+    assert at.session_state["messages"][1]["pii_count"] == 3
+
+def test_ui_no_pii_badge_without_pii(fake_bot):
+    at = app()
+    at.chat_input[0].set_value(BY_ID["T01"]["message"]).run()
+    assert not any("PII masked" in md.value for md in at.expander[0].markdown)
+
+@live
+def test_live_x1_masked_and_auto_refund(real_bot):
+    d = decide(real_bot, X["X1"])
+    assert d["route"] == "auto_refund" and d["order_id"] == "FK1001" and d["pii_count"] == 3
+
+# ---- Ex2: language signal ----
+@pytest.mark.parametrize("raw,label", [
+    ("kannada", "kannada"), ("Kannada.", "kannada"), ("  TELUGU\n", "telugu"), ("hinglish", "hinglish"),
+    ("Hindi", "hindi"), ("english", "english"), ("other", "other"), ("klingon", "english"), ("", "english"),
+    ("The language is Kannada", "english"), ("123", "english"),
+])
+def test_parse_language(fake_bot, raw, label):
+    assert fake_bot.parse_language(raw) == label
+
+@pytest.mark.parametrize("msg,lang", [
+    (X["X2"], "kannada"), (X["X3"], "telugu"), (BY_ID["T01"]["message"], "hinglish"),
+    (BY_ID["T03"]["message"], "english"), (X["X4"], "hinglish"), ("मेरा ऑर्डर FK1006 कहाँ है?", "hindi"),
+])
+def test_language_signal(fake_bot, msg, lang):
+    assert decide(fake_bot, msg)["signals"]["language"] == lang
+
+def test_t01_is_hinglish(fake_bot):
+    assert decide(fake_bot, BY_ID["T01"]["message"])["signals"]["language"] == "hinglish"
+
+def test_language_falls_back_to_english_on_bad_answer(fake_bot):
+    FAKE["script"]["language"] = lambda call: "Klingon, definitely"
+    assert decide(fake_bot, BY_ID["T01"]["message"])["signals"]["language"] == "english"
+
+@pytest.mark.parametrize("text,lang", [
+    (X["X2"], "kannada"), (X["X3"], "telugu"), ("मेरा ऑर्डर FK1006 कहाँ है?", "hindi"),
+    ("FK1001 ok ಸರಿ", "kannada"), (BY_ID["T01"]["message"], None), (X["X1"], None), ("", None),
+])
+def test_script_language(fake_bot, text, lang):
+    assert fake_bot.script_language(text) == lang
+
+def test_indic_script_skips_the_language_llm(fake_bot):
+    FAKE["script"]["language"] = lambda call: "hindi"  # what gpt-4o-mini answered for X3 in the live run
+    for msg, lang in [(X["X2"], "kannada"), (X["X3"], "telugu")]:
+        assert decide(fake_bot, msg)["signals"]["language"] == lang
+    assert calls("language") == []
+    assert decide(fake_bot, BY_ID["T01"]["message"])["signals"]["language"] == "hindi"  # Latin text: the LLM decides
+    assert len(calls("language")) == 1
+
+def test_kannada_apology_even_when_ai_is_down(fake_bot):
+    FAKE["fail"]["*"] = auth_error
+    d = decide(fake_bot, X["X2"])
+    assert d["signals"]["language"] == "kannada" and reply(fake_bot, d) == fake_bot.APOLOGY["kannada"]
+
+def test_language_reads_masked_text(fake_bot):
+    decide(fake_bot, X["X1"])
+    assert "[PHONE]" in calls("language")[-1]["human"] and "98450" not in calls("language")[-1]["human"]
+
+def test_x2_kannada_wismo_with_coupon(fake_bot):
+    d = decide(fake_bot, X["X2"])
+    assert d["route"] == "wismo" and d["signals"]["language"] == "kannada"
+    noted = fake_bot.add_note(d)
+    assert noted["language"] == "kannada" and "Rs 50 coupon" in noted["note"]
+    reply(fake_bot, d)
+    assert "Reply in kannada" in calls("lane")[-1]["system"] and "Rs 50 coupon" in calls("lane")[-1]["system"]
+
+def test_x3_telugu_reply_language(fake_bot):
+    d = decide(fake_bot, X["X3"])
+    assert d["signals"]["language"] == "telugu" and d["order_id"] == "FK1003"
+    reply(fake_bot, d)
+    assert "Reply in telugu" in calls("lane")[-1]["system"]
+
+def test_other_language_replies_in_english(fake_bot):
+    FAKE["script"]["language"] = lambda call: "other"
+    d = decide(fake_bot, "Bonjour, ma commande FK1006?")
+    assert d["signals"]["language"] == "other" and fake_bot.add_note(d)["language"] == "english"
+    reply(fake_bot, d)
+    assert "Reply in english" in calls("lane")[-1]["system"]
+
+def test_language_does_not_change_routes(fake_bot):
+    FAKE["script"]["language"] = lambda call: "telugu"
+    assert not wrong_routes(fake_bot.router.batch(inputs()))
+
+def test_language_runs_in_parallel_with_intent(fake_bot):
+    FAKE["delay"].update(intent=0.4, language=0.4)
+    t0 = time.perf_counter()
+    decide(fake_bot, BY_ID["T01"]["message"])
+    elapsed = time.perf_counter() - t0
+    assert len(calls("intent")) == 1 and len(calls("language")) == 1
+    assert 0.4 <= elapsed < 0.7, elapsed  # in sequence it would be >= 0.8s
+
+def test_ui_shows_language_and_ops_column(fake_bot):
+    at = app()
+    at.chat_input[0].set_value(X["X2"]).run()
+    assert not at.exception
+    assert any("Language: **kannada**" in md.value for md in at.expander[0].markdown)
+    assert at.session_state["log"][0]["language"] == "kannada"
+
+def test_ops_queue_has_language_column(fake_bot):
+    at = app()
+    at.chat_input[0].set_value(BY_ID["T09"]["message"]).run()
+    assert "language" in at.dataframe[0].value.columns
+
+KANNADA, TELUGU = re.compile("[ಀ-೿]"), re.compile("[ఀ-౿]")
+
+@live
+def test_live_x2_kannada_reply_with_coupon(real_bot):
+    d = decide(real_bot, X["X2"])
+    assert d["signals"]["language"] == "kannada" and d["route"] == "wismo"
+    text = reply(real_bot, d)
+    assert KANNADA.search(text) and "50" in text
+
+@live
+def test_live_x3_telugu_reply(real_bot):
+    d = decide(real_bot, X["X3"])
+    assert d["signals"]["language"] == "telugu" and TELUGU.search(reply(real_bot, d))
+
+@live
+def test_live_t01_hinglish(real_bot):
+    assert decide(real_bot, BY_ID["T01"]["message"])["signals"]["language"] == "hinglish"
+
+# ---- Ex3: retry + fallback model + safe default ----
+MAIN, BACKUP, BROKEN = "openai/gpt-4o-mini", "meta-llama/llama-3.1-8b-instruct", "this/model-does-not-exist"
+
+def boom(error):
+    """A scripted answer that fails: lets one prompt kind fail while the others work."""
+    def fail(call): raise error()
+    return fail
+
+@pytest.fixture
+def broken_main_bot(monkeypatch):
+    """.env has MODEL=this/model-does-not-exist (OpenRouter answers 404)."""
+    monkeypatch.setenv("MODEL", BROKEN)
+    bot = load_bot(monkeypatch, fake=True)
+    FAKE["fail"][BROKEN] = not_found_error
+    yield bot
+    sys.modules.pop("bot", None)
+
+def test_llms_built_without_sdk_retries_and_with_timeout(fake_bot):
+    assert {kw["model"] for kw in FAKE["init"]} == {MAIN, BACKUP, "openai/gpt-4o"}
+    assert all(kw["max_retries"] == 0 and kw["timeout"] == 20 for kw in FAKE["init"])
+
+def test_backup_model_from_env(monkeypatch):
+    monkeypatch.setenv("BACKUP_MODEL", "some/other-model")
+    load_bot(monkeypatch, fake=True)
+    assert "some/other-model" in {kw["model"] for kw in FAKE["init"]}
+    sys.modules.pop("bot", None)
+
+@pytest.mark.parametrize("errors", [
+    [timeout_error, timeout_error], [server_error], [lambda: status_error(openai.RateLimitError, 429)],
+    [lambda: openai.APIConnectionError(request=REQ)],
+])
+def test_transient_errors_are_retried_on_main(fake_bot, errors):
+    FAKE["fail"][MAIN] = [e() for e in errors]
+    assert fake_bot.safe_llm.invoke("Classify: hi").content.startswith("general")
+    assert [c["model"] for c in calls()] == [MAIN] * (len(errors) + 1)
+
+def test_retries_exhausted_then_backup(fake_bot):
+    FAKE["fail"][MAIN] = [timeout_error() for _ in range(3)]
+    out = fake_bot.safe_llm.invoke("Classify: hi")
+    assert [c["model"] for c in calls()] == [MAIN, MAIN, MAIN, BACKUP]
+    assert out.response_metadata["model_name"] == BACKUP
+
+@pytest.mark.parametrize("error", [not_found_error, auth_error, lambda: status_error(openai.BadRequestError, 400)])
+def test_permanent_errors_skip_retry_and_go_to_backup(fake_bot, error):
+    FAKE["fail"][MAIN] = error
+    fake_bot.safe_llm.invoke("Classify: hi")
+    assert [c["model"] for c in calls()] == [MAIN, BACKUP]
+
+def test_safe_llm_raises_only_when_both_models_fail(fake_bot):
+    FAKE["fail"]["*"] = auth_error
+    with pytest.raises(openai.AuthenticationError):
+        fake_bot.safe_llm.invoke("Classify: hi")
+
+def test_unpack_intent(fake_bot):
+    x = {"signals": {"intent_msg": AIMessage(content="food_safety,angry", response_metadata={"model_name": "m"}),
+                     "safety": True}}
+    s = fake_bot.unpack_intent(x)["signals"]
+    assert s == {"safety": True, "intent": "food_safety", "intent_model": "m"}
+
+def test_main_model_missing_all_18_still_answered_by_backup(broken_main_bot):
+    results = broken_main_bot.router.batch(inputs())
+    assert not wrong_routes(results)
+    assert {r["signals"]["intent_model"] for r in results} == {BACKUP}
+    for r in results:
+        assert reply(broken_main_bot, r) == "Fake reply."
+    assert [c["model"] for c in calls("lane")] == [BROKEN, BACKUP] * 18  # main tried once (404: no retry), then backup
+
+def test_main_model_missing_stream_uses_backup(broken_main_bot):
+    d = decide(broken_main_bot, BY_ID["T01"]["message"])
+    assert streamed(broken_main_bot, d) == "Fake reply."
+
+def test_both_models_down_unclear_human_review_apology(fake_bot):
+    FAKE["fail"]["*"] = auth_error
+    results = fake_bot.router.batch(inputs())
+    for r in results:
+        assert r["signals"]["intent"] == "unclear" and r["signals"]["intent_model"] == "none (AI down)"
+        assert r["signals"]["language"] == "english" and r["route"] == "human_review"
+        assert reply(fake_bot, r) == fake_bot.APOLOGY["english"]
+    assert streamed(fake_bot, results[0]) == fake_bot.APOLOGY["english"]
+
+def test_both_down_unclear_reason(fake_bot):
+    FAKE["fail"]["*"] = timeout_error
+    d = decide(fake_bot, BY_ID["T01"]["message"])  # no safety words, no amount: the unclear rule decides
+    assert d["reasons"] == ["unclear intent"]
+
+def test_apology_in_customer_language(fake_bot):
+    FAKE["script"]["lane"] = boom(auth_error)
+    d = decide(fake_bot, X["X2"])
+    assert reply(fake_bot, d) == fake_bot.APOLOGY["kannada"]
+    assert fake_bot.apology({"language": "other"}) == fake_bot.APOLOGY["english"]
+    assert fake_bot.apology({}) == fake_bot.APOLOGY["english"]
+
+def test_intent_falls_back_while_language_still_works(fake_bot):
+    FAKE["script"]["intent"] = boom(auth_error)
+    d = decide(fake_bot, X["X3"])
+    assert d["signals"]["intent"] == "unclear" and d["signals"]["language"] == "telugu" and d["route"] == "human_review"
+
+def test_stream_does_not_retry_but_falls_back(fake_bot):
+    d = decide(fake_bot, BY_ID["T01"]["message"])
+    FAKE["calls"].clear()
+    FAKE["fail"][MAIN] = [timeout_error()]
+    assert streamed(fake_bot, d) == "Fake reply."
+    assert [c["model"] for c in calls("lane")] == [MAIN, BACKUP]  # documented: RunnableRetry does not wrap .stream
+
+def test_invoke_retries_the_lane(fake_bot):
+    d = decide(fake_bot, BY_ID["T01"]["message"])
+    FAKE["calls"].clear()
+    FAKE["fail"][MAIN] = [timeout_error()]
+    assert reply(fake_bot, d) == "Fake reply."
+    assert [c["model"] for c in calls("lane")] == [MAIN, MAIN]
+
+def test_no_try_except_in_bot():
+    src = (ROOT / "bot.py").read_text()
+    assert not re.search(r"^\s*(try:|except\b)", src, re.M)
+
+def test_ui_shows_backup_model(broken_main_bot):
+    at = app()
+    at.chat_input[0].set_value(BY_ID["T01"]["message"]).run()
+    assert not at.exception
+    assert any(f"intent answered by: `{BACKUP}`" in md.value for md in at.expander[0].markdown)
+
+def test_ui_never_crashes_when_ai_is_down(fake_bot):
+    FAKE["fail"]["*"] = auth_error
+    at = app()
+    at.chat_input[0].set_value(BY_ID["T01"]["message"]).run()
+    assert not at.exception
+    last = at.session_state["messages"][-1]
+    assert last["route"] == "human_review" and last["content"] == fake_bot.APOLOGY["english"]
+
+@live
+def test_live_bad_main_model_uses_backup(monkeypatch):
+    # Acceptance: all 18 tickets still get a reply with no exception, and the backup model answered.
+    # Routing quality is the backup model's own (llama-3.1-8b scored 11-14/18 in our runs), so it is printed, not asserted.
+    monkeypatch.setenv("MODEL", BROKEN)
+    bot = load_bot(monkeypatch, fake=False)
+    results = bot.router.batch(inputs(), config={"max_concurrency": 5})
+    assert all("llama" in r["signals"]["intent_model"] for r in results)
+    replies = bot.reply_chain.batch(results, config={"max_concurrency": 5})
+    assert all(out["reply"].strip() for out in replies)
+    print(f"\nbackup-only routing: {18 - len(wrong_routes(results))}/18, wrong: {wrong_routes(results)}")
+    sys.modules.pop("bot", None)
+
+@live
+def test_live_wrong_key_is_unclear_human_review_apology(monkeypatch):
+    monkeypatch.setenv("OPENROUTER_API_KEY", "sk-or-wrong-key-for-this-test")
+    bot = load_bot(monkeypatch, fake=False)
+    d = decide(bot, BY_ID["T01"]["message"])
+    assert d["signals"]["intent"] == "unclear" and d["route"] == "human_review"
+    assert reply(bot, d) == bot.APOLOGY["english"]
+    sys.modules.pop("bot", None)
+
+# ---- Ex4: ops hand-off card ----
+CARD_KEYS = {"team", "priority", "summary_en", "next_step"}
+
+def card_of(bot, msg, history=()):
+    return bot.reply_chain.invoke(decide(bot, msg, history))["card"]
+
+@pytest.mark.parametrize("tid,team,priority", [
+    ("T09", "food_safety", "P1"), ("T13", "finance", "P2"), ("T10", "rider_ops", "P2"),
+])
+def test_card_team_and_priority_for_known_reasons(fake_bot, tid, team, priority):
+    card = card_of(fake_bot, BY_ID[tid]["message"])  # the fake LLM says support/P3: Python rules win
+    assert card["team"] == team and card["priority"] == priority and set(card) == CARD_KEYS
+
+def test_x4_hinglish_food_safety_p1(fake_bot):
+    card = card_of(fake_bot, X["X4"])
+    assert (card["team"], card["priority"]) == ("food_safety", "P1")
+    assert "summary_en is one sentence in English" in calls("card")[-1]["system"]
+
+def test_card_uses_llm_team_for_other_escalations(fake_bot):
+    FAKE["script"]["card"] = lambda call: ('{"team": "finance", "priority": "P2", "summary_en": "Amount above limit.",'
+                                           ' "next_step": "Check the order value."}')
+    card = card_of(fake_bot, BY_ID["T18"]["message"])  # amount>1000: no fixed team
+    assert card == {"team": "finance", "priority": "P2", "summary_en": "Amount above limit.", "next_step": "Check the order value."}
+
+@pytest.mark.parametrize("raw,team,priority", [
+    ('{"team": "aliens", "priority": "P9", "summary_en": "x", "next_step": "y"}', "support", "P2"),
+    ('{"team": "rider_ops", "priority": "P1", "summary_en": "x", "next_step": "y"}', "rider_ops", "P1"),
+    ('{"team": "FINANCE", "priority": "p2", "summary_en": "x", "next_step": "y"}', "support", "P2"),
+])
+def test_card_values_are_checked_in_python(fake_bot, raw, team, priority):
+    FAKE["script"]["card"] = lambda call: raw
+    card = card_of(fake_bot, BY_ID["T18"]["message"])
+    assert (card["team"], card["priority"]) == (team, priority)
+
+@pytest.mark.parametrize("raw", ["not json at all", "[1, 2, 3]", '"just a string"', '{"team": "finance"}'])
+def test_bad_card_answers_never_crash(fake_bot, raw):
+    FAKE["script"]["card"] = lambda call: raw
+    d = decide(fake_bot, BY_ID["T09"]["message"])
+    for card in [fake_bot.reply_chain.invoke(d)["card"],
+                 next(c["card"] for c in fake_bot.reply_chain.stream(d) if "card" in c)]:
+        assert set(card) == CARD_KEYS and (card["team"], card["priority"]) == ("food_safety", "P1")
+        assert card["summary_en"] and card["next_step"]
+
+def test_check_card_unit(fake_bot):
+    x = {"reasons": ["amount>1000"], "raw": {"team": "support", "priority": "P3", "summary_en": "", "next_step": None}}
+    card = fake_bot.check_card(x)
+    assert card["summary_en"] == "Card not generated by AI; read the chat." and card["next_step"]
+    assert fake_bot.check_card({"reasons": ["food safety"], "raw": None})["team"] == "food_safety"
+
+def test_card_llm_down_gives_default_card(fake_bot):
+    FAKE["script"]["card"] = boom(auth_error)
+    card = card_of(fake_bot, BY_ID["T13"]["message"])
+    assert card["team"] == "finance" and card["summary_en"].startswith("Card not generated")
+
+def test_t01_no_card_and_no_extra_llm_call(fake_bot):
+    out = fake_bot.reply_chain.invoke(decide(fake_bot, BY_ID["T01"]["message"]))
+    assert out == {"reply": "Fake reply.", "card": None}
+    assert calls("card") == [] and [c["kind"] for c in calls()].count("lane") == 1
+    assert len(calls()) == 3  # intent + language + lane, nothing else
+
+def test_only_human_review_gets_cards(fake_bot):
+    for t in TICKETS:
+        card = card_of(fake_bot, t["message"])
+        if t["expected_route"] == "human_review":
+            assert set(card) == CARD_KEYS and card["team"] in fake_bot.TEAMS and card["priority"] in fake_bot.PRIORITIES
+        else:
+            assert card is None
+    assert len(calls("card")) == sum(t["expected_route"] == "human_review" for t in TICKETS)
+
+def test_card_prompt_sees_masked_text_note_and_history(fake_bot):
+    hist = [HumanMessage(content="FK1009 ki biryani kharab thi, call 9845012345"), AIMessage(content="Sorry to hear.")]
+    card_of(fake_bot, "ab bacche ko ulti ho rahi hai", hist)
+    c = calls("card")[-1]
+    text = " ".join(m.content for m in c["messages"])
+    assert "biryani" in text and "[PHONE]" in text and "9845012345" not in text
+    assert "order=FK1009" in c["system"] and "reasons=['food safety']" in c["system"]
+
+def test_stream_yields_reply_text_then_one_card(fake_bot):
+    chunks = list(fake_bot.reply_chain.stream(decide(fake_bot, BY_ID["T09"]["message"])))
+    cards = [c["card"] for c in chunks if "card" in c]
+    assert "".join(c.get("reply", "") for c in chunks) == "Fake reply."
+    assert len(cards) == 1 and cards[0]["team"] == "food_safety"
+    none_chunks = [c for c in fake_bot.reply_chain.stream(decide(fake_bot, BY_ID["T01"]["message"])) if "card" in c]
+    assert none_chunks == [{"card": None}]
+
+def test_reply_and_card_run_in_parallel(fake_bot):
+    d = decide(fake_bot, BY_ID["T09"]["message"])
+    FAKE["delay"].update(lane=0.4, card=0.4)
+    t0 = time.perf_counter()
+    fake_bot.reply_chain.invoke(d)
+    assert time.perf_counter() - t0 < 0.7
+
+def test_memory_stores_reply_text_not_dict(fake_bot):
+    cfg = {"configurable": {"session_id": "ex4"}}
+    out = fake_bot.bot.invoke({"input": BY_ID["T09"]["message"]}, config=cfg)
+    assert out["reply"] == "Fake reply." and out["card"]["team"] == "food_safety"
+    assert [m.content for m in fake_bot.get_history("ex4").messages] == [BY_ID["T09"]["message"], "Fake reply."]
+    chunks = list(fake_bot.bot.stream({"input": "aur kab tak?"}, config=cfg))
+    assert "".join(c.get("reply", "") for c in chunks) == "Fake reply." and len(fake_bot.get_history("ex4").messages) == 4
+
+def test_ui_shows_card_and_ops_columns(fake_bot):
+    at = app()
+    at.chat_input[0].set_value(BY_ID["T09"]["message"]).run()
+    assert not at.exception
+    assert at.chat_message[1].markdown[0].value == "Fake reply."  # text, not a dict
+    assert any("Hand-off card" in md.value for md in at.expander[0].markdown)
+    assert at.session_state["messages"][1]["card"]["team"] == "food_safety"
+    queue = at.dataframe[0].value
+    assert {"team", "priority", "summary"} <= set(queue.columns) and queue["team"].tolist() == ["food_safety"]
+
+def test_ui_no_card_for_auto_refund(fake_bot):
+    at = app()
+    at.chat_input[0].set_value(BY_ID["T01"]["message"]).run()
+    assert not any("Hand-off card" in md.value for md in at.expander[0].markdown)
+    assert at.session_state["messages"][1]["card"] is None
+
+ASCII_SENTENCE = re.compile(r"^[\x00-\x7F₹]+$")
+
+@live
+@pytest.mark.parametrize("tid,team", [("T09", "food_safety"), ("T13", "finance"), ("T10", "rider_ops")])
+def test_live_cards(real_bot, tid, team):
+    card = card_of(real_bot, BY_ID[tid]["message"])
+    assert card["team"] == team and ASCII_SENTENCE.match(card["summary_en"])
+
+@live
+def test_live_x4_card_summary_in_english(real_bot):
+    card = card_of(real_bot, X["X4"])
+    assert (card["team"], card["priority"]) == ("food_safety", "P1") and ASCII_SENTENCE.match(card["summary_en"])
+
+# ---- Ex5: bulk triage ----
+ROW_KEYS = {"id", "order_id", "intent", "language", "route", "reasons"}
+
+def test_bulk_triage_18_sample_tickets(fake_bot):
+    rows = fake_bot.bulk_triage.invoke(TICKETS)
+    assert [r["id"] for r in rows] == [t["id"] for t in TICKETS]
+    assert all(set(r) == ROW_KEYS for r in rows)
+    assert [r["route"] for r in rows] == [t["expected_route"] for t in TICKETS]
+    assert len(calls("lane")) == 0  # routed only, no replies
+
+def test_bulk_triage_reads_csv_file(fake_bot):
+    import pandas as pd
+    rows = pd.read_csv(ROOT / "data" / "tickets.csv", dtype=str, keep_default_na=False).to_dict("records")
+    assert [r["route"] for r in fake_bot.bulk_triage.invoke(rows)] == [t["expected_route"] for t in TICKETS]
+
+@pytest.mark.parametrize("bad", [{"id": "E1", "message": ""}, {"id": "E2", "message": "   \n"}, {"id": "E3"},
+                                 {"id": "E4", "message": None}])
+def test_empty_row_is_error_and_others_fine(fake_bot, bad):
+    rows = fake_bot.bulk_triage.invoke(TICKETS[:9] + [bad] + TICKETS[9:])
+    broken = rows[9]
+    assert broken["id"] == bad["id"] and broken["route"] == "error" and "empty message" in broken["reasons"]
+    good = rows[:9] + rows[10:]
+    assert [r["route"] for r in good] == [t["expected_route"] for t in TICKETS]
+    assert len(calls("intent")) == 18  # no LLM call for the empty row
+
+def test_llm_failure_on_one_row_does_not_stop_others(fake_bot):
+    def flaky_intent(call):
+        if "POISON" in call["human"]: raise auth_error()
+        return fake_intent(call)
+    FAKE["script"]["intent"] = flaky_intent
+    rows = fake_bot.bulk_triage.invoke([{"id": "P1", "message": "POISON FK1001 bread missing"}] + TICKETS)
+    assert rows[0]["route"] == "human_review" and rows[0]["intent"] == "unclear"  # Ex3: unclear, not a crash
+    assert [r["route"] for r in rows[1:]] == [t["expected_route"] for t in TICKETS]
+
+def test_to_rows_turns_exceptions_into_error_rows(fake_bot):
+    ok = decide(fake_bot, BY_ID["T01"]["message"])
+    out = fake_bot.to_rows({"rows": [{"id": "A"}, {"id": "B"}], "results": [ok, KeyError("order_id")]})
+    assert out[0] == {"id": "A", "order_id": "FK1001", "intent": "missing_item", "language": "hinglish",
+                      "route": "auto_refund", "reasons": "amount<=300, clean customer"}
+    assert out[1]["route"] == "error" and out[1]["reasons"] == "KeyError: 'order_id'" and out[1]["order_id"] is None
+
+def test_require_message(fake_bot):
+    assert fake_bot.require_message({"input": "hi"}) == {"input": "hi"}
+    with pytest.raises(ValueError, match="empty message"): fake_bot.require_message({"input": "  "})
+
+def test_bulk_batch_is_at_least_2x_faster_than_a_loop(fake_bot):
+    FAKE["delay"].update(intent=0.05, language=0.05)
+    t0 = time.perf_counter()
+    for t in TICKETS: fake_bot.router.invoke({"input": t["message"], "chat_history": []})
+    loop = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    fake_bot.bulk_triage.invoke(TICKETS)
+    batch = time.perf_counter() - t0
+    assert batch * 2 <= loop, (batch, loop)
+
+def test_max_concurrency_from_config_is_respected(fake_bot):
+    import threading
+    active, peak, lock = [0], [0], threading.Lock()
+    def counting(call):
+        with lock: active[0] += 1; peak[0] = max(peak[0], active[0])
+        time.sleep(0.03)
+        with lock: active[0] -= 1
+        return fake_intent(call)
+    FAKE["script"]["intent"] = counting
+    fake_bot.bulk_triage.invoke(TICKETS)
+    assert 1 < peak[0] <= 5
+    peak[0] = 0
+    fake_bot.bulk_triage.invoke(TICKETS, config={"max_concurrency": 1})
+    assert peak[0] == 1
+
+def test_bulk_triage_handles_a_big_backlog(fake_bot):
+    backlog = [{"id": f"{t['id']}-{i}", "message": t["message"]} for i in range(6) for t in TICKETS]  # 108 tickets
+    rows = fake_bot.bulk_triage.invoke(backlog)
+    assert len(rows) == 108 and [r["route"] for r in rows] == [t["expected_route"] for t in TICKETS] * 6
+
+def test_ui_bulk_triage_sample_button(fake_bot):
+    at = app()
+    next(b for b in at.button if b.label == "Triage the 18 sample tickets").click().run()
+    assert not at.exception
+    result = at.session_state["bulk"]["result"]
+    assert len(result) == 18 and (result.route == [t["expected_route"] for t in TICKETS]).all()
+    assert any("Matches expected_route: 18/18" in c.value for c in at.caption)
+    assert any("18 tickets routed in" in c.value for c in at.caption)
+
+def test_ui_has_csv_uploader(fake_bot):
+    at = app()
+    assert at.get("file_uploader")
+
+@live
+def test_live_bulk_triage_18_and_speed(real_bot):
+    t0 = time.perf_counter()
+    for t in TICKETS: real_bot.router.invoke({"input": t["message"], "chat_history": []})
+    loop = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    rows = real_bot.bulk_triage.invoke(TICKETS + [{"id": "X5", "message": ""}])
+    batch = time.perf_counter() - t0
+    print(f"\nfor-loop {loop:.1f}s vs batch {batch:.1f}s")
+    assert [r["route"] for r in rows[:18]] == [t["expected_route"] for t in TICKETS] and rows[18]["route"] == "error"
+    assert batch * 2 <= loop
+
+# ---- Ex6: model switcher ----
+STRONG = "openai/gpt-4o"
+MODEL_OF = {"mini": MAIN, "llama": BACKUP, "strong": STRONG}
+
+def cfg(key): return {"configurable": {"model": key}}
+
+@pytest.mark.parametrize("key", ["mini", "llama", "strong"])
+def test_same_router_object_switches_model(fake_bot, key):
+    router_before = fake_bot.router
+    results = fake_bot.router.batch(inputs(), config=cfg(key))
+    assert fake_bot.router is router_before and not wrong_routes(results)
+    assert {c["model"] for c in calls()} == {MODEL_OF[key]}
+    assert {r["signals"]["intent_model"] for r in results} == {MODEL_OF[key]}
+
+def test_default_model_is_mini(fake_bot):
+    decide(fake_bot, BY_ID["T01"]["message"])
+    assert {c["model"] for c in calls()} == {MAIN}
+
+def test_switch_reaches_lanes_and_card_on_invoke_and_stream(fake_bot):
+    d = fake_bot.router.invoke(inputs([BY_ID["T09"]])[0], config=cfg("strong"))
+    fake_bot.reply_chain.invoke(d, config=cfg("strong"))
+    list(fake_bot.reply_chain.stream(d, config=cfg("llama")))
+    by_kind = {k: [c["model"] for c in calls(k)] for k in ("intent", "language", "lane", "card")}
+    assert by_kind == {"intent": [STRONG], "language": [STRONG], "lane": [STRONG, BACKUP], "card": [STRONG, BACKUP]}
+
+def test_switch_survives_retry_and_fallback_wrappers(fake_bot):
+    FAKE["fail"][STRONG] = not_found_error
+    d = fake_bot.router.invoke(inputs([BY_ID["T01"]])[0], config=cfg("strong"))
+    assert d["signals"]["intent_model"] == BACKUP and d["route"] == "auto_refund"  # strong tried, then Ex3 backup
+    assert [c["model"] for c in calls("intent")] == [STRONG, BACKUP]
+
+def test_unknown_model_key_degrades_safely(fake_bot):
+    # configurable_alternatives raises ValueError for an unknown key; Ex3's backup model (not configurable) answers
+    d = fake_bot.router.invoke(inputs([BY_ID["T01"]])[0], config=cfg("gpt-99"))
+    assert d["signals"]["intent_model"] == BACKUP and d["route"] == "auto_refund"
+    assert {c["model"] for c in calls()} == {BACKUP}
+
+def test_bulk_triage_respects_model_choice(fake_bot):
+    fake_bot.bulk_triage.invoke(TICKETS[:3], config=cfg("llama"))
+    assert {c["model"] for c in calls()} == {BACKUP}
+
+@pytest.mark.parametrize("intent", ["missing_item", "general", "refund_status", "coupon_pass", "wismo", "unclear",
+                                    "damaged_spoiled", "expired", "food_safety", "payment_issue"])
+@pytest.mark.parametrize("key", ["mini", "llama", "strong"])
+def test_t18_vip_2000_is_human_review_whatever_the_model_says(fake_bot, key, intent):
+    FAKE["script"]["intent"] = lambda call: intent + ",angry"
+    d = fake_bot.router.invoke(inputs([BY_ID["T18"]])[0], config=cfg(key))
+    assert d["route"] == "human_review" and d["signals"]["claimed_amount"] == 2000.0
+
+def test_evaluate_scores_each_model(fake_bot):
+    rows = fake_bot.evaluate.batch(["mini", "llama", "strong"], config={"max_concurrency": 1})
+    assert [(r["model"], r["model_name"], r["score"], r["of"]) for r in rows] == [
+        ("mini", MAIN, 18, 18), ("llama", BACKUP, 18, 18), ("strong", STRONG, 18, 18)]
+    assert [r["answered_by"] for r in rows] == [MAIN, BACKUP, STRONG]
+    assert all(r["seconds"] >= 0 and r["tokens"] == 0 for r in rows)  # the fake is not a chat model: no usage callback
+
+def test_evaluate_counts_wrong_routes(fake_bot):
+    FAKE["script"]["intent"] = lambda call: "general,neutral"
+    assert fake_bot.evaluate.invoke("llama")["score"] < 18
+
+@pytest.mark.parametrize("usage,expected", [
+    ({"openai/gpt-4o-mini": {"input_tokens": 1_000_000, "output_tokens": 0}}, 0.15 * 88),
+    ({"openai/gpt-4o-mini-2024-07-18": {"input_tokens": 0, "output_tokens": 1_000_000}}, 0.60 * 88),
+    ({"openai/gpt-4o": {"input_tokens": 1_000_000, "output_tokens": 1_000_000}}, 12.5 * 88),
+    ({"meta-llama/llama-3.1-8b-instruct": {"input_tokens": 500_000, "output_tokens": 0}}, 0.01 * 88),
+    ({"unknown/model": {"input_tokens": 10, "output_tokens": 10}}, 0.0),
+])
+def test_rupees_uses_longest_matching_price(fake_bot, usage, expected):
+    assert fake_bot.rupees(usage) == pytest.approx(expected)
+
+def test_ui_model_select_and_memory_across_switch(fake_bot):
+    at = app()
+    at.sidebar.selectbox[0].set_value("llama").run()
+    at.chat_input[0].set_value(BY_ID["T01"]["message"]).run()
+    assert at.session_state["messages"][1]["model"] == "llama"
+    assert {c["model"] for c in calls()} == {BACKUP}
+    FAKE["calls"].clear()
+    at.sidebar.selectbox[0].set_value("strong").run()
+    at.chat_input[0].set_value("refund kab milega?").run()
+    assert not at.exception
+    last = at.session_state["messages"][-1]
+    assert last["model"] == "strong" and {c["model"] for c in calls()} == {STRONG}
+    assert at.session_state["log"][-1]["order_id"] == "FK1001"  # memory kept: order id from the earlier turn
+    assert any("Model chosen: `strong`" in md.value for md in at.expander[-1].markdown)
+
+def test_ui_compare_models_button(fake_bot):
+    at = app()
+    next(b for b in at.button if b.label == "Compare models").click().run()
+    assert not at.exception
+    table = at.session_state["compare"]
+    assert table["model"].tolist() == ["mini", "llama", "strong"] and (table["score"] == 18).all()
+
+@live
+def test_live_compare_mini_and_llama(real_bot):
+    rows = real_bot.evaluate.batch(["mini", "llama"], config={"max_concurrency": 1})
+    for r in rows:
+        print(f"\n{r['model']:6} {r['score']}/18 {r['seconds']}s {r['tokens']} tokens ~Rs{r['rs_per_ticket']}/ticket"
+              f" answered_by={r['answered_by']}")
+        assert r["tokens"] > 0 and 0 <= r["score"] <= 18
+    assert rows[0]["score"] >= 17  # the default model must route (almost) perfectly; llama's score is only reported
+
+@live
+def test_live_t18_both_models(real_bot):
+    for key in ["mini", "llama"]:
+        assert real_bot.router.invoke(inputs([BY_ID["T18"]])[0], config=cfg(key))["route"] == "human_review"
+
+# ---- Ex7: live pipeline tracker ----
+ROUTER_STATIONS = {"router", "pii mask", "order id", "signals (parallel)", "unpack_intent", "decide_route"}
+
+def traced(bot, msg, trace, key="mini"):
+    config = {"configurable": {"model": key, "trace": trace}}
+    d = bot.router.invoke({"input": msg, "chat_history": []}, config=config)
+    list(bot.reply_chain.stream(d, config=config))
+    return d
+
+def by_name(trace): return {e["name"]: e for e in trace}
+
+def test_t09_trace_has_every_station_once(fake_bot):
+    trace = []
+    traced(fake_bot, BY_ID["T09"]["message"], trace)
+    names = [e["name"] for e in trace]
+    expected = set(fake_bot.SIGNAL_STATIONS) | ROUTER_STATIONS | {"lane: human_review", "hand-off card", "guard check"}
+    assert set(names) == expected and len(names) == len(expected)
+    assert all(e["end"] is not None and e["end"] >= e["start"] for e in trace)
+
+def test_t01_trace_has_its_lane_and_no_card(fake_bot):
+    trace = []
+    traced(fake_bot, BY_ID["T01"]["message"], trace)
+    names = {e["name"] for e in trace}
+    assert "lane: auto_refund" in names and "hand-off card" not in names
+    assert not any(n.startswith("lane: ") and n != "lane: auto_refund" for n in names)
+
+def test_signal_times_add_up_to_more_than_router_total(fake_bot):
+    FAKE["delay"].update(intent=0.3, language=0.3)
+    trace = []
+    traced(fake_bot, BY_ID["T09"]["message"], trace)
+    rows = {r["station"]: r for r in fake_bot.trace_table(trace)}
+    signals_sum = sum(rows[s]["seconds"] for s in fake_bot.SIGNAL_STATIONS)
+    assert signals_sum >= 0.6 and rows["router"]["seconds"] < 0.5 and signals_sum > rows["router"]["seconds"]
+
+def test_parallel_stations_overlap(fake_bot):
+    FAKE["delay"].update(intent=0.3)
+    trace = []
+    traced(fake_bot, BY_ID["T09"]["message"], trace)
+    e = by_name(trace)
+    starts = [e[s]["start"] for s in fake_bot.SIGNAL_STATIONS]
+    assert max(starts) < e["intent (LLM)"]["end"]                       # every signal starts before the LLM is done
+    assert e["order lookup"]["end"] < e["intent (LLM)"]["end"]          # lookups do not wait for the LLM
+    assert e["decide_route"]["start"] >= e["intent (LLM)"]["end"]       # decide_route waits for all signals
+
+def test_parallel_listeners_run_on_worker_threads(fake_bot):
+    trace = []
+    fake_bot.router.invoke({"input": BY_ID["T09"]["message"], "chat_history": []}, config={"configurable": {"trace": trace}})
+    e = by_name(trace)
+    signal_threads = {e[s]["thread"] for s in fake_bot.SIGNAL_STATIONS}
+    assert "MainThread" not in signal_threads and len(signal_threads) > 1
+    assert e["decide_route"]["thread"] == "MainThread"
+
+def test_tracker_off_records_nothing_and_changes_nothing(fake_bot):
+    with_trace, trace = [], []
+    for t in TICKETS:
+        with_trace.append(fake_bot.router.invoke({"input": t["message"], "chat_history": []},
+                                                 config={"configurable": {"trace": trace}}))
+    FAKE["calls"].clear()
+    without = fake_bot.router.batch(inputs())
+    assert not wrong_routes(without) and not wrong_routes(with_trace)
+    assert [r["route"] for r in without] == [r["route"] for r in with_trace]
+    from types import SimpleNamespace
+    fake_bot.on_start(SimpleNamespace(id=1, name="x", start_time=None), {})  # no trace in config: no error
+    fake_bot.on_end(SimpleNamespace(id=1, end_time=None), {"configurable": {}})
+
+def test_concurrent_requests_keep_separate_traces(fake_bot):
+    a, b = [], []
+    fake_bot.router.batch(inputs([BY_ID["T09"], BY_ID["T01"]]),
+                          config=[{"configurable": {"trace": a}}, {"configurable": {"trace": b}}])
+    assert sorted(e["name"] for e in a) == sorted(e["name"] for e in b)
+    assert len({e["id"] for e in a} & {e["id"] for e in b}) == 0
+
+def test_trace_table_sorting_and_running_rows(fake_bot):
+    from datetime import datetime, timedelta
+    t0 = datetime(2026, 10, 12, 20, 0, 0)
+    trace = [{"id": 1, "name": "intent (LLM)", "start": t0, "end": t0 + timedelta(seconds=0.84), "thread": "w1"},
+             {"id": 2, "name": "order lookup", "start": t0, "end": t0 + timedelta(seconds=0.01), "thread": "w2"},
+             {"id": 3, "name": "decide_route", "start": t0 + timedelta(seconds=0.85), "end": None, "thread": "MainThread"}]
+    rows = fake_bot.trace_table(trace)
+    assert [r["station"] for r in rows] == ["order lookup", "intent (LLM)", "decide_route"]
+    assert rows[1]["seconds"] == 0.84 and rows[2]["seconds"] is None and rows[2]["at_s"] == 0.85
+    assert fake_bot.trace_table([]) == []
+
+def test_trace_table_uses_exact_end_times_for_ties(fake_bot):
+    from datetime import datetime, timedelta
+    t0 = datetime(2026, 10, 12, 20, 0, 0)
+    trace = [{"id": 1, "name": "router", "start": t0, "end": t0 + timedelta(seconds=1.3604), "thread": "MainThread"},
+             {"id": 2, "name": "decide_route", "start": t0 + timedelta(seconds=1.3601), "end": t0 + timedelta(seconds=1.3602),
+              "thread": "MainThread"}]
+    assert [r["station"] for r in fake_bot.trace_table(trace)] == ["decide_route", "router"]
+
+def test_ui_tracker_shows_stations_route_and_overlap(fake_bot):
+    FAKE["delay"].update(intent=0.25, language=0.25)
+    at = app()
+    at.chat_input[0].set_value(BY_ID["T09"]["message"]).run()
+    assert not at.exception
+    text = at.session_state["messages"][1]["trace"]
+    for station in ["intent (LLM)", "order lookup", "safety keywords", "decide_route", "lane: human_review"]:
+        assert f"✓ {station}" in text
+    assert "-> human_review (food safety)" in text and "they overlapped" in text
+    assert at.status[0].label == "Done: human_review"
+    assert any("Pipeline tracker" in md.value for md in at.expander[0].markdown)
+
+def test_ui_tracker_off(fake_bot):
+    at = app()
+    at.sidebar.toggle[0].set_value(False).run()
+    at.chat_input[0].set_value(BY_ID["T09"]["message"]).run()
+    assert not at.exception and len(at.status) == 0
+    m = at.session_state["messages"][1]
+    assert m["trace"] is None and m["route"] == "human_review" and m["content"] == "Fake reply."
+
+@live
+def test_live_t09_tracker(real_bot):
+    trace = []
+    traced(real_bot, BY_ID["T09"]["message"], trace)
+    rows = {r["station"]: r for r in real_bot.trace_table(trace)}
+    assert sum(rows[s]["seconds"] for s in real_bot.SIGNAL_STATIONS) > rows["router"]["seconds"]
+
+# ---- Bonus: reply guard ----
+LEGAL_CASE = "Don't worry, your ₹780 will be refunded today."
+
+@pytest.mark.parametrize("text,flags", [
+    (LEGAL_CASE, ["money promise"]),
+    ("Your refund of Rs 780 has been approved.", ["money promise"]),
+    ("Refund will reach you tomorrow.", ["money promise"]),
+    ("We will process the refund within 2 days.", ["money promise"]),
+    ("Aapka ₹780 refund aaj ho jayega.", ["money promise"]),
+    ("ನಿಮ್ಮ ₹780 ರೀಫಂಡ್ ಇಂದು ಬರುತ್ತದೆ.", ["money promise"]),
+    ("మీ రీఫండ్ రేపు వస్తుంది.", ["money promise"]),
+    ("आपका रिफंड आज हो जाएगा।", ["money promise"]),
+    ("As per route=human_review we escalate.", ["internal words"]),
+    ("reasons=['amount>1000'] so a senior agent will call.", ["internal words"]),
+    ("Our internal note says you are VIP.", ["internal words"]),
+    ("Your case is in human_review.", ["internal words"]),
+    ("Your fraud score is high.", ["internal words"]),
+    ("₹780 refund today, says the internal note.", ["money promise", "internal words"]),
+    ("A senior FreshKart agent will contact you soon.", []),
+    ("Your ₹245 order was delivered more than 48 hours ago, so we cannot accept this request.", []),
+    ("We are sorry. A senior agent will review your refund request.", []),
+    ("Your order cost ₹245. A senior agent will look at the refund.", []),  # amount and refund in different sentences
+    ("The reason is that the order was delivered over 48 hours ago.", []),
+    ("Your order FK1001 was delivered on time.", []),
+])
+def test_regex_flags(fake_bot, text, flags):
+    assert fake_bot.regex_flags(text) == flags
+
+def test_templates_and_apologies_pass_the_regex(fake_bot):
+    texts = [t for lane in fake_bot.SAFE_TEMPLATE.values() for t in lane.values()] + list(fake_bot.APOLOGY.values())
+    assert all(fake_bot.regex_flags(t) == [] for t in texts)
+
+def test_legal_case_replaced_by_template_without_llm_check(fake_bot):
+    FAKE["script"]["lane"] = lambda call: LEGAL_CASE
+    d = decide(fake_bot, BY_ID["T09"]["message"])  # human_review, hinglish
+    assert reply(fake_bot, d) == fake_bot.SAFE_TEMPLATE["human_review"]["hinglish"]
+    assert calls("checker") == []  # the regex caught it: no LLM check needed
+
+def test_llm_checker_catches_what_regex_misses(fake_bot):
+    FAKE["script"]["lane"] = lambda call: "We will put the full amount back in your account very soon."
+    FAKE["script"]["checker"] = lambda call: "Yes"
+    d = decide(fake_bot, BY_ID["T13"]["message"])  # human_review (payment)
+    assert reply(fake_bot, d) == fake_bot.SAFE_TEMPLATE["human_review"]["hinglish"]
+    assert len(calls("checker")) == 1 and calls("checker")[0]["human"].startswith("We will put the full amount")
+
+def test_clean_draft_passes(fake_bot):
+    FAKE["script"]["lane"] = lambda call: "A senior agent will contact you soon. Please keep the packet."
+    d = decide(fake_bot, BY_ID["T09"]["message"])
+    assert reply(fake_bot, d) == "A senior agent will contact you soon. Please keep the packet."
+    assert len(calls("checker")) == 1
+
+def test_checker_down_fails_closed(fake_bot):
+    FAKE["script"]["lane"] = lambda call: "A senior agent will contact you soon."
+    FAKE["script"]["checker"] = boom(auth_error)
+    d = decide(fake_bot, BY_ID["T10"]["message"])
+    assert reply(fake_bot, d) == fake_bot.SAFE_TEMPLATE["human_review"]["hinglish"]
+
+def test_policy_decline_is_guarded(fake_bot):
+    FAKE["script"]["lane"] = lambda call: "Sorry, but don't worry: your ₹149 refund will be done today."
+    d = decide(fake_bot, BY_ID["T05"]["message"])
+    assert d["route"] == "policy_decline"
+    assert reply(fake_bot, d) == fake_bot.SAFE_TEMPLATE["policy_decline"]["hinglish"]
+
+def test_policy_decline_clean_reason_passes(fake_bot):
+    text = "Sorry, your ₹245 order was delivered more than 48 hours ago, so we cannot accept this request."
+    FAKE["script"]["lane"] = lambda call: text
+    d = decide(fake_bot, BY_ID["T17"]["message"])
+    assert d["route"] == "policy_decline" and reply(fake_bot, d) == text
+
+@pytest.mark.parametrize("tid", ["T01", "T02", "T06", "T16"])  # auto_refund, substitution, wismo, info
+def test_unguarded_lanes_skip_the_check(fake_bot, tid):
+    FAKE["script"]["lane"] = lambda call: "Your ₹210 refund will reach your FK Wallet today."
+    d = decide(fake_bot, BY_ID[tid]["message"])
+    assert d["route"] not in fake_bot.GUARDED
+    assert reply(fake_bot, d) == "Your ₹210 refund will reach your FK Wallet today."  # promising IS the job here
+    assert calls("checker") == []
+
+def test_checker_calls_only_for_guarded_tickets(fake_bot):
+    for t in TICKETS:
+        reply(fake_bot, decide(fake_bot, t["message"]))
+    guarded = sum(t["expected_route"] in ("human_review", "policy_decline") for t in TICKETS)
+    assert len(calls("checker")) == guarded
+
+def test_template_in_customer_language(fake_bot):
+    FAKE["script"]["lane"] = lambda call: LEGAL_CASE
+    FAKE["script"]["language"] = lambda call: "kannada"
+    assert reply(fake_bot, decide(fake_bot, BY_ID["T09"]["message"])) == fake_bot.SAFE_TEMPLATE["human_review"]["kannada"]
+    FAKE["script"]["language"] = lambda call: "other"
+    assert reply(fake_bot, decide(fake_bot, BY_ID["T09"]["message"])) == fake_bot.SAFE_TEMPLATE["human_review"]["english"]
+
+def test_guarded_stream_never_shows_the_draft(fake_bot):
+    FAKE["script"]["lane"] = lambda call: LEGAL_CASE
+    chunks = list(fake_bot.reply_chain.stream(decide(fake_bot, BY_ID["T09"]["message"])))
+    texts = [c["reply"] for c in chunks if "reply" in c]
+    assert texts == [fake_bot.SAFE_TEMPLATE["human_review"]["hinglish"]]  # one chunk, after the check
+    assert not any("780" in str(c) for c in chunks)
+
+def test_fixed_apology_is_not_rechecked(fake_bot):
+    FAKE["fail"]["*"] = auth_error
+    d = decide(fake_bot, BY_ID["T09"]["message"])
+    assert reply(fake_bot, d) == fake_bot.APOLOGY["english"]
+
+def test_guard_station_in_tracker(fake_bot):
+    t09, t01 = [], []
+    traced(fake_bot, BY_ID["T09"]["message"], t09)
+    traced(fake_bot, BY_ID["T01"]["message"], t01)
+    assert "guard check" in {e["name"] for e in t09} and "guard check" not in {e["name"] for e in t01}
+
+def test_ui_shows_template_not_draft(fake_bot):
+    FAKE["script"]["lane"] = lambda call: LEGAL_CASE
+    at = app()
+    at.chat_input[0].set_value(BY_ID["T09"]["message"]).run()
+    assert not at.exception
+    assert at.chat_message[1].markdown[0].value == fake_bot.SAFE_TEMPLATE["human_review"]["hinglish"]
+    assert "780" not in at.session_state["messages"][1]["content"]
+
+@live
+@pytest.mark.parametrize("tid", ["T09", "T13", "T18", "T05", "T17"])
+def test_live_escalation_replies_make_no_promises(real_bot, tid):
+    text = reply(real_bot, decide(real_bot, BY_ID[tid]["message"]))
+    assert not real_bot.money_promise(text) and not re.search(real_bot.INTERNAL, text)
+
 # ---- live (real OpenRouter calls) ----
-@pytest.mark.skipif(not HAS_KEY, reason="no OPENROUTER_API_KEY")
+@live
 @pytest.mark.parametrize("tid,route", [("T09", "human_review"), ("T01", "auto_refund")])
 def test_live_round_trip(real_bot, tid, route):
     msg = next(t["message"] for t in TICKETS if t["id"] == tid)
@@ -116,3 +1231,8 @@ def test_live_round_trip(real_bot, tid, route):
     assert not at.exception
     last = at.session_state["messages"][-1]
     assert last["route"] == route and last["content"].strip()
+
+@live
+def test_live_router_18_of_18(real_bot):
+    results = real_bot.router.batch(inputs(), config={"max_concurrency": 5})
+    assert not wrong_routes(results), wrong_routes(results)
