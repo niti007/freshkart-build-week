@@ -970,7 +970,7 @@ def test_t09_trace_has_every_station_once(fake_bot):
     trace = []
     traced(fake_bot, BY_ID["T09"]["message"], trace)
     names = [e["name"] for e in trace]
-    expected = set(fake_bot.SIGNAL_STATIONS) | ROUTER_STATIONS | {"lane: human_review", "hand-off card"}
+    expected = set(fake_bot.SIGNAL_STATIONS) | ROUTER_STATIONS | {"lane: human_review", "hand-off card", "guard check"}
     assert set(names) == expected and len(names) == len(expected)
     assert all(e["end"] is not None and e["end"] >= e["start"] for e in trace)
 
@@ -1064,6 +1064,128 @@ def test_live_t09_tracker(real_bot):
     traced(real_bot, BY_ID["T09"]["message"], trace)
     rows = {r["station"]: r for r in real_bot.trace_table(trace)}
     assert sum(rows[s]["seconds"] for s in real_bot.SIGNAL_STATIONS) > rows["router"]["seconds"]
+
+# ---- Bonus: reply guard ----
+LEGAL_CASE = "Don't worry, your ₹780 will be refunded today."
+
+@pytest.mark.parametrize("text,flags", [
+    (LEGAL_CASE, ["money promise"]),
+    ("Your refund of Rs 780 has been approved.", ["money promise"]),
+    ("Refund will reach you tomorrow.", ["money promise"]),
+    ("We will process the refund within 2 days.", ["money promise"]),
+    ("Aapka ₹780 refund aaj ho jayega.", ["money promise"]),
+    ("ನಿಮ್ಮ ₹780 ರೀಫಂಡ್ ಇಂದು ಬರುತ್ತದೆ.", ["money promise"]),
+    ("మీ రీఫండ్ రేపు వస్తుంది.", ["money promise"]),
+    ("आपका रिफंड आज हो जाएगा।", ["money promise"]),
+    ("As per route=human_review we escalate.", ["internal words"]),
+    ("reasons=['amount>1000'] so a senior agent will call.", ["internal words"]),
+    ("Our internal note says you are VIP.", ["internal words"]),
+    ("Your case is in human_review.", ["internal words"]),
+    ("Your fraud score is high.", ["internal words"]),
+    ("₹780 refund today, says the internal note.", ["money promise", "internal words"]),
+    ("A senior FreshKart agent will contact you soon.", []),
+    ("Your ₹245 order was delivered more than 48 hours ago, so we cannot accept this request.", []),
+    ("We are sorry. A senior agent will review your refund request.", []),
+    ("Your order cost ₹245. A senior agent will look at the refund.", []),  # amount and refund in different sentences
+    ("The reason is that the order was delivered over 48 hours ago.", []),
+    ("Your order FK1001 was delivered on time.", []),
+])
+def test_regex_flags(fake_bot, text, flags):
+    assert fake_bot.regex_flags(text) == flags
+
+def test_templates_and_apologies_pass_the_regex(fake_bot):
+    texts = [t for lane in fake_bot.SAFE_TEMPLATE.values() for t in lane.values()] + list(fake_bot.APOLOGY.values())
+    assert all(fake_bot.regex_flags(t) == [] for t in texts)
+
+def test_legal_case_replaced_by_template_without_llm_check(fake_bot):
+    FAKE["script"]["lane"] = lambda call: LEGAL_CASE
+    d = decide(fake_bot, BY_ID["T09"]["message"])  # human_review, hinglish
+    assert reply(fake_bot, d) == fake_bot.SAFE_TEMPLATE["human_review"]["hinglish"]
+    assert calls("checker") == []  # the regex caught it: no LLM check needed
+
+def test_llm_checker_catches_what_regex_misses(fake_bot):
+    FAKE["script"]["lane"] = lambda call: "We will put the full amount back in your account very soon."
+    FAKE["script"]["checker"] = lambda call: "Yes"
+    d = decide(fake_bot, BY_ID["T13"]["message"])  # human_review (payment)
+    assert reply(fake_bot, d) == fake_bot.SAFE_TEMPLATE["human_review"]["hinglish"]
+    assert len(calls("checker")) == 1 and calls("checker")[0]["human"].startswith("We will put the full amount")
+
+def test_clean_draft_passes(fake_bot):
+    FAKE["script"]["lane"] = lambda call: "A senior agent will contact you soon. Please keep the packet."
+    d = decide(fake_bot, BY_ID["T09"]["message"])
+    assert reply(fake_bot, d) == "A senior agent will contact you soon. Please keep the packet."
+    assert len(calls("checker")) == 1
+
+def test_checker_down_fails_closed(fake_bot):
+    FAKE["script"]["lane"] = lambda call: "A senior agent will contact you soon."
+    FAKE["script"]["checker"] = boom(auth_error)
+    d = decide(fake_bot, BY_ID["T10"]["message"])
+    assert reply(fake_bot, d) == fake_bot.SAFE_TEMPLATE["human_review"]["hinglish"]
+
+def test_policy_decline_is_guarded(fake_bot):
+    FAKE["script"]["lane"] = lambda call: "Sorry, but don't worry: your ₹149 refund will be done today."
+    d = decide(fake_bot, BY_ID["T05"]["message"])
+    assert d["route"] == "policy_decline"
+    assert reply(fake_bot, d) == fake_bot.SAFE_TEMPLATE["policy_decline"]["hinglish"]
+
+def test_policy_decline_clean_reason_passes(fake_bot):
+    text = "Sorry, your ₹245 order was delivered more than 48 hours ago, so we cannot accept this request."
+    FAKE["script"]["lane"] = lambda call: text
+    d = decide(fake_bot, BY_ID["T17"]["message"])
+    assert d["route"] == "policy_decline" and reply(fake_bot, d) == text
+
+@pytest.mark.parametrize("tid", ["T01", "T02", "T06", "T16"])  # auto_refund, substitution, wismo, info
+def test_unguarded_lanes_skip_the_check(fake_bot, tid):
+    FAKE["script"]["lane"] = lambda call: "Your ₹210 refund will reach your FK Wallet today."
+    d = decide(fake_bot, BY_ID[tid]["message"])
+    assert d["route"] not in fake_bot.GUARDED
+    assert reply(fake_bot, d) == "Your ₹210 refund will reach your FK Wallet today."  # promising IS the job here
+    assert calls("checker") == []
+
+def test_checker_calls_only_for_guarded_tickets(fake_bot):
+    for t in TICKETS:
+        reply(fake_bot, decide(fake_bot, t["message"]))
+    guarded = sum(t["expected_route"] in ("human_review", "policy_decline") for t in TICKETS)
+    assert len(calls("checker")) == guarded
+
+def test_template_in_customer_language(fake_bot):
+    FAKE["script"]["lane"] = lambda call: LEGAL_CASE
+    FAKE["script"]["language"] = lambda call: "kannada"
+    assert reply(fake_bot, decide(fake_bot, BY_ID["T09"]["message"])) == fake_bot.SAFE_TEMPLATE["human_review"]["kannada"]
+    FAKE["script"]["language"] = lambda call: "other"
+    assert reply(fake_bot, decide(fake_bot, BY_ID["T09"]["message"])) == fake_bot.SAFE_TEMPLATE["human_review"]["english"]
+
+def test_guarded_stream_never_shows_the_draft(fake_bot):
+    FAKE["script"]["lane"] = lambda call: LEGAL_CASE
+    chunks = list(fake_bot.reply_chain.stream(decide(fake_bot, BY_ID["T09"]["message"])))
+    texts = [c["reply"] for c in chunks if "reply" in c]
+    assert texts == [fake_bot.SAFE_TEMPLATE["human_review"]["hinglish"]]  # one chunk, after the check
+    assert not any("780" in str(c) for c in chunks)
+
+def test_fixed_apology_is_not_rechecked(fake_bot):
+    FAKE["fail"]["*"] = auth_error
+    d = decide(fake_bot, BY_ID["T09"]["message"])
+    assert reply(fake_bot, d) == fake_bot.APOLOGY["english"]
+
+def test_guard_station_in_tracker(fake_bot):
+    t09, t01 = [], []
+    traced(fake_bot, BY_ID["T09"]["message"], t09)
+    traced(fake_bot, BY_ID["T01"]["message"], t01)
+    assert "guard check" in {e["name"] for e in t09} and "guard check" not in {e["name"] for e in t01}
+
+def test_ui_shows_template_not_draft(fake_bot):
+    FAKE["script"]["lane"] = lambda call: LEGAL_CASE
+    at = app()
+    at.chat_input[0].set_value(BY_ID["T09"]["message"]).run()
+    assert not at.exception
+    assert at.chat_message[1].markdown[0].value == fake_bot.SAFE_TEMPLATE["human_review"]["hinglish"]
+    assert "780" not in at.session_state["messages"][1]["content"]
+
+@live
+@pytest.mark.parametrize("tid", ["T09", "T13", "T18", "T05", "T17"])
+def test_live_escalation_replies_make_no_promises(real_bot, tid):
+    text = reply(real_bot, decide(real_bot, BY_ID[tid]["message"]))
+    assert not real_bot.money_promise(text) and not re.search(real_bot.INTERNAL, text)
 
 # ---- live (real OpenRouter calls) ----
 @live

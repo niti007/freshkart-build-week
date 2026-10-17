@@ -293,10 +293,76 @@ def lane(instruction):
     # Ex 3: if both models fail, the customer gets a fixed apology (in their language) instead of a crash.
     return (p | safe_llm | StrOutputParser()).with_fallbacks([RunnableLambda(apology)])
 
+# Bonus: reply guard for the escalation lanes (draft chain, then RunnablePassthrough.assign(verdict=...), then a
+# RunnableBranch that sends the draft or a safe template). The check is plain-Python regex first, LLM second:
+# - the regex is deterministic and cannot be talked out of its answer (a prompt injection in the chat cannot reach
+#   it), costs nothing, and when it fires the LLM checker is skipped;
+# - the LLM checker catches what the English/number patterns cannot (paraphrases, other languages). If the checker
+#   itself fails, the verdict is "unsafe": the guard fails closed.
+# Trade-off: the guarded lanes can no longer stream token by token. The verdict needs the WHOLE draft, so nothing
+# can be shown until the draft is finished and checked (+1 LLM call, ~1 s). That is fine for escalations: they are
+# rare, a human takes over anyway, and one wrong money promise costs far more than a short wait. The other four
+# lanes are not guarded, still stream, and cost nothing extra.
+GUARDED = {"human_review", "policy_decline"}
+REFUND_WORD = r"(?i)refund|रिफंड|ರೀಫಂಡ್|రీఫండ్"
+AMOUNT_OR_DATE = (r"(?i)(?:₹|\brs\.?|\binr)\s?\d|\b(?:today|tomorrow|tonight|aaj|kal)\b|\bwithin\s+\d|"
+                  r"\bin\s+\d+\s*(?:hours?|days?|mins?|minutes?)\b|आज|कल|ಇಂದು|ನಾಳೆ|ఈరోజు|నేడు|రేపు")
+INTERNAL = (r"(?i)\broute\s*=|\breasons\s*=|internal note|\b(?:auto_refund|human_review|policy_decline)\b|"
+            r"fraud|refunds_30d")
+
+def money_promise(text):
+    """A sentence that mentions a refund together with an amount or a date/time is a promise."""
+    return any(re.search(REFUND_WORD, s) and re.search(AMOUNT_OR_DATE, s) for s in re.split(r"(?<=[.!?।])\s+", text))
+
+def regex_flags(text):
+    return [why for why, hit in [("money promise", money_promise(text)), ("internal words", re.search(INTERNAL, text))] if hit]
+
+checker_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You check a FreshKart support reply before it is sent. Answer yes or no.\n"
+               "Answer yes if the reply promises a refund amount or a refund date/time, or reveals internal words "
+               "such as route, reasons, internal note, fraud score or a route name like human_review.\n"
+               "Stating the reason for a decline in plain words is allowed. Saying a senior agent will contact the "
+               "customer is allowed.\nAnswer ONLY yes or no."),
+    ("human", "{draft}"),
+])
+checker_chain = (RunnableLambda(lambda x: {"draft": x["draft"]}) | checker_prompt | safe_llm | StrOutputParser()
+                 | RunnableLambda(lambda s: "unsafe (llm)" if s.strip().lower().startswith("yes") else "safe")
+                 ).with_fallbacks([RunnableLambda(lambda x: "unsafe (checker down)")])
+verdict = RunnableBranch((lambda x: x["draft"] in APOLOGY.values(), RunnableLambda(lambda x: "safe (fixed text)")),
+                         (lambda x: bool(regex_flags(x["draft"])), RunnableLambda(lambda x: "unsafe (regex)")),
+                         checker_chain)
+
+SAFE_TEMPLATE = {
+    "human_review": {
+        "english": "Thank you for your patience. A senior FreshKart agent is reviewing your case and will contact you shortly.",
+        "hinglish": "Aapke patience ke liye thank you. Ek senior FreshKart agent aapka case dekh rahe hain aur jaldi aapse contact karenge.",
+        "hindi": "धैर्य के लिए धन्यवाद। एक वरिष्ठ FreshKart एजेंट आपका मामला देख रहे हैं और जल्द ही आपसे संपर्क करेंगे।",
+        "kannada": "ನಿಮ್ಮ ತಾಳ್ಮೆಗೆ ಧನ್ಯವಾದಗಳು. ಹಿರಿಯ FreshKart ಏಜೆಂಟ್ ನಿಮ್ಮ ಪ್ರಕರಣವನ್ನು ಪರಿಶೀಲಿಸುತ್ತಿದ್ದಾರೆ ಮತ್ತು ಶೀಘ್ರದಲ್ಲೇ ನಿಮ್ಮನ್ನು ಸಂಪರ್ಕಿಸುತ್ತಾರೆ.",
+        "telugu": "మీ ఓర్పుకు ధన్యవాదాలు. సీనియర్ FreshKart ఏజెంట్ మీ కేసును పరిశీలిస్తున్నారు, త్వరలో మిమ్మల్ని సంప్రదిస్తారు.",
+    },
+    "policy_decline": {
+        "english": "We're sorry, we can't approve this request under our refund policy. If you'd like, a FreshKart agent can review it with you.",
+        "hinglish": "Sorry, hamari refund policy ke hisaab se yeh request approve nahi ho sakti. Aap chahein to FreshKart agent aapke saath ise review kar sakte hain.",
+        "hindi": "क्षमा करें, हमारी रिफंड नीति के अनुसार यह अनुरोध स्वीकार नहीं किया जा सकता। आप चाहें तो FreshKart एजेंट आपके साथ इसकी समीक्षा कर सकते हैं।",
+        "kannada": "ಕ್ಷಮಿಸಿ, ನಮ್ಮ ರೀಫಂಡ್ ನೀತಿಯ ಪ್ರಕಾರ ಈ ವಿನಂತಿಯನ್ನು ಅನುಮೋದಿಸಲು ಸಾಧ್ಯವಿಲ್ಲ. ನೀವು ಬಯಸಿದರೆ, FreshKart ಏಜೆಂಟ್ ನಿಮ್ಮೊಂದಿಗೆ ಇದನ್ನು ಪರಿಶೀಲಿಸಬಹುದು.",
+        "telugu": "క్షమించండి, మా రీఫండ్ విధానం ప్రకారం ఈ అభ్యర్థనను ఆమోదించలేము. మీరు కోరుకుంటే, FreshKart ఏజెంట్ మీతో కలిసి దీన్ని పరిశీలించగలరు.",
+    },
+}
+
+def guarded(name, draft_chain):
+    templates = SAFE_TEMPLATE[name]
+    return (RunnablePassthrough.assign(draft=draft_chain)
+            | RunnablePassthrough.assign(verdict=station("guard check", verdict))
+            | RunnableBranch((lambda x: x["verdict"].startswith("unsafe"),
+                              RunnableLambda(lambda x: templates.get(x.get("language"), templates["english"]))),
+                             RunnableLambda(lambda x: x["draft"])))
+
+def lane_for(name):
+    return station(f"lane: {name}", guarded(name, lane(LANES[name])) if name in GUARDED else lane(LANES[name]))
+
 branch = RunnableBranch(
-    *[(lambda x, name=name: x["route"] == name, station(f"lane: {name}", lane(text)))
-      for name, text in LANES.items() if name != "human_review"],
-    station("lane: human_review", lane(LANES["human_review"])),
+    *[(lambda x, name=name: x["route"] == name, lane_for(name)) for name in LANES if name != "human_review"],
+    lane_for("human_review"),
 )
 
 # Ex 4: ops hand-off card (RunnableParallel + prompt | llm | JsonOutputParser + RunnableBranch). Only human_review

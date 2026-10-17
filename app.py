@@ -196,6 +196,8 @@ with tab_how:
                                       (Ex7: every station is named and timed by listeners -> live tracker)
         |
  RunnableBranch: auto_refund | wismo | substitution | info | policy_decline | human_review
+        |           (Bonus: policy_decline + human_review drafts -> reply guard: regex, then LLM yes/no
+        |            -> draft if safe, else a fixed safe template; these two lanes no longer stream)
         |
  StrOutputParser -> streamed reply in the customer's language   (memory: RunnableWithMessageHistory)
         +  in parallel (Ex4): human_review only -> card_prompt | llm | JsonOutputParser -> hand-off card
