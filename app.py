@@ -56,6 +56,10 @@ with tab_chat:
     for m in ss.messages:
         with st.chat_message(m["role"]):
             st.write(m["content"])
+            if m.get("card"):
+                c = m["card"]
+                st.info(f"📋 **Ops Escalation Card** [{c['priority']}] → **Team:** `{c['team']}`\n\n"
+                        f"**Summary:** {c['summary_en']}\n\n**Next Step:** {c['next_step']}")
             if m["role"] == "assistant": why(m)
     if msg:
         with st.chat_message("user"):
@@ -64,17 +68,33 @@ with tab_chat:
         with st.chat_message("assistant"):
             with st.spinner("Checking order, customer and policy..."):
                 decision = router.invoke({"input": msg, "chat_history": history.messages})
-            reply = st.write_stream(reply_chain.stream(decision))
+            card_holder = [None]
+            def stream_tokens(gen):
+                for chunk in gen:
+                    if isinstance(chunk, dict):
+                        if "card" in chunk and chunk["card"]: card_holder[0] = chunk["card"]
+                        if "reply" in chunk and chunk["reply"]: yield chunk["reply"]
+                    else:
+                        yield chunk
+            reply = st.write_stream(stream_tokens(reply_chain.stream(decision)))
+            card_data = card_holder[0]
+            if card_data:
+                st.info(f"📋 **Ops Escalation Card** [{card_data['priority']}] → **Team:** `{card_data['team']}`\n\n"
+                        f"**Summary:** {card_data['summary_en']}\n\n**Next Step:** {card_data['next_step']}")
             m = {"role": "assistant", "content": reply, "route": decision["route"],
                  "reasons": decision["reasons"], "signals": decision["signals"],
-                 "pii_count": decision.get("pii_count", 0), "masked_input": decision.get("masked_input", "")}
+                 "pii_count": decision.get("pii_count", 0), "masked_input": decision.get("masked_input", ""),
+                 "card": card_data}
             why(m)
         history.add_user_message(decision.get("masked_input", msg))
         history.add_ai_message(reply)
         ss.messages += [{"role": "user", "content": msg}, m]
         ss.log.append({"time": datetime.now().strftime("%H:%M:%S"), "order_id": decision["order_id"],
                        "intent": decision["signals"]["intent"], "language": decision["signals"].get("language", "english"),
-                       "route": decision["route"], "reasons": "; ".join(decision["reasons"]), "message": msg})
+                       "route": decision["route"], "team": card_data.get("team") if card_data else "-",
+                       "priority": card_data.get("priority") if card_data else "-",
+                       "summary": card_data.get("summary_en") if card_data else "-",
+                       "reasons": "; ".join(decision["reasons"]), "message": msg})
 
 with tab_ops:
     cols = st.columns(len(COLORS))
@@ -107,9 +127,11 @@ with tab_how:
         |
  RunnableLambda(decide_route)                          plain Python rules, no LLM
         |
- RunnableBranch: auto_refund | wismo | substitution | info | policy_decline | human_review
+ RunnableLambda(add_note)
         |
- StrOutputParser -> streamed multilingual reply        (memory: RunnableWithMessageHistory)
+ RunnableParallel(reply = RunnableBranch(...), card = RunnableBranch(human_review -> card_chain, None))
+        |
+ Streamed reply + Ops escalation card                  (memory: RunnableWithMessageHistory)
 """, language="text")
     st.table(pd.DataFrame([
         ("Cell 2 Setup", "get_llm, read", "Data tab"),
@@ -120,6 +142,7 @@ with tab_how:
         ("Cell 16 Fault-Tolerant NLU", "primary_nlu, backup_nlu", "Why this answer? (intent, language, model)"),
         ("Cell 18 decide_route", "decide_route", "Route badge, Ops queue, metrics"),
         ("Cell 20 Robust Lanes", "lane, backup_llm, fallback", "Streamed reply in Chat with fallback"),
+        ("Cell 21 Ops Card", "card_chain, card_branch", "Ops escalation card in Chat & Queue"),
         ("Cell 22 Memory", "full_chain, store, get_history", "New chat button"),
         ("Cell 24 Evaluation", "router", "Sample ticket + Send"),
     ], columns=["Notebook cell", "bot.py", "App widget"]))

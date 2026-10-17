@@ -5,7 +5,7 @@ import pandas as pd
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.output_parsers import StrOutputParser
+from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
 from langchain_core.runnables import RunnableLambda, RunnablePassthrough, RunnableParallel, RunnableBranch
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.chat_history import InMemoryChatMessageHistory
@@ -214,6 +214,42 @@ branch = RunnableBranch(
     lane(LANES["human_review"]),
 )
 
+# Cell 21: Ops Hand-off Card (Exercise 4)
+card_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are an internal operations triage assistant for FreshKart.\n"
+               "For this escalated customer ticket, create an Ops hand-off card as a JSON object.\n"
+               "Rules:\n"
+               "- team must be exactly one of: food_safety, finance, rider_ops, support\n"
+               "  (use food_safety for illness/vomiting/allergy, finance for double debit/wallet, rider_ops for misconduct, support for other)\n"
+               "- priority must be exactly one of: P1, P2, P3\n"
+               "  (use P1 for food poisoning/health/safety, P2 for money/fraud/misconduct, P3 for general escalations)\n"
+               "- summary_en: a concise 1-sentence summary in English\n"
+               "- next_step: concrete immediate ops action (e.g., call customer, file FSSAI report, initiate bank trace)\n"
+               "Internal note: {note}\n"
+               "Answer ONLY valid JSON with keys: team, priority, summary_en, next_step."),
+    ("human", "{input}"),
+])
+
+TEAMS = {"food_safety", "finance", "rider_ops", "support"}
+PRIORITIES = {"P1", "P2", "P3"}
+
+def validate_card(data):
+    if not isinstance(data, dict): return None
+    team = str(data.get("team", "")).lower().strip()
+    priority = str(data.get("priority", "")).upper().strip()
+    return {
+        "team": team if team in TEAMS else "support",
+        "priority": priority if priority in PRIORITIES else "P2",
+        "summary_en": data.get("summary_en", "Customer escalation"),
+        "next_step": data.get("next_step", "Contact customer"),
+    }
+
+card_chain = (card_prompt | llm | JsonOutputParser() | RunnableLambda(validate_card)).with_fallbacks([RunnableLambda(lambda _: None)])
+card_branch = RunnableBranch(
+    (lambda x: x["route"] == "human_review", card_chain),
+    RunnableLambda(lambda _: None)
+)
+
 # Cell 22: full chain + memory. The app uses router (decide) then reply_chain (stream) to avoid a 2nd intent call.
 router = (RunnablePassthrough.assign(
               masked_input=RunnableLambda(lambda x: mask_pii(x["input"])[0]),
@@ -222,7 +258,7 @@ router = (RunnablePassthrough.assign(
           | RunnablePassthrough.assign(nlu=nlu_chain)
           | RunnablePassthrough.assign(signals=signals)
           | RunnableLambda(decide_route))
-reply_chain = RunnableLambda(add_note) | branch
+reply_chain = RunnableLambda(add_note) | RunnableParallel(reply=branch, card=card_branch)
 full_chain = router | reply_chain
 
 store = {}
@@ -234,6 +270,13 @@ bot = RunnableWithMessageHistory(full_chain, get_history, input_messages_key="in
 if __name__ == "__main__":  # python bot.py T09
     t = next(t for t in TICKETS if t["id"] == (sys.argv[1] if len(sys.argv) > 1 else "T01"))
     print("Customer:", t["message"], "\nBot: ", end="")
+    card_seen = None
     for chunk in bot.stream({"input": t["message"]}, config={"configurable": {"session_id": "cli"}}):
-        print(chunk, end="")
+        if isinstance(chunk, dict):
+            if "reply" in chunk and chunk["reply"]: print(chunk["reply"], end="")
+            if "card" in chunk and chunk["card"]: card_seen = chunk["card"]
+        else:
+            print(chunk, end="")
+    if card_seen:
+        print("\n\n[Ops Card]:", card_seen)
     print()
