@@ -11,6 +11,28 @@ uv venv .venv && uv pip install --python .venv/bin/python -r requirements.txt
 grep -nE "pydantic|BaseModel|^class |with_structured_output" bot.py app.py   # must print nothing
 ```
 
+## Live results (OpenRouter, 2026-10-17)
+
+The full suite was run with a real key: **306 tests passed** (284 offline + 22 live). The live run found two real issues, which are fixed in their own commits:
+
+1. **Ex2:** gpt-4o-mini labelled the Telugu ticket X3 `hindi`, 4 times out of 4. Kannada, Telugu and Devanagari scripts are now detected in Python.
+2. **Ex7:** the tracker listed `router` before `decide_route` when their times tied after rounding. Rows are now sorted by the exact end time.
+
+| Exercise | Live check | Result |
+|---|---|---|
+| Ex1 | X1 with phone, email and UPI | masked (3 items), `FK1001`, `auto_refund` ✓ |
+| Ex2 | X2 Kannada / X3 Telugu / T01 | reply in Kannada script mentioning the ₹50 coupon ✓ · reply in Telugu script ✓ · `hinglish` ✓ |
+| Ex2 | router time, intent call alone vs intent + language in parallel (median of 5) | 0.81s vs 1.12s |
+| Ex3 | `MODEL=this/model-does-not-exist` | all 18 answered by `meta-llama/llama-3.1-8b-instruct`, all got a reply, no exception ✓. Backup-only routing 11–12/18 (see Ex3) |
+| Ex3 | wrong API key | `unclear` → `human_review` → fixed apology, no crash ✓ |
+| Ex4 | T09 / T13 / T10 / X4 cards | `food_safety` P1 / `finance` / `rider_ops` / `food_safety` P1, every `summary_en` in English ✓ |
+| Ex5 | for-loop vs `bulk_triage` (18 tickets + 1 empty row) | 26.1s vs 5.5s (4.7x); a second run gave 27.8s vs 8.4s (3.3x). Empty row → `error` ✓ |
+| Ex6 | same `router`, three models (see table in Ex6) | mini 18/18 · strong 18/18 · llama 10–12/18 |
+| Ex6 | T18 on mini and llama | `human_review` on both ✓ |
+| Ex7 | T09 tracker | sum of signal stations 2.11s > router total 1.36s ✓ |
+| Bonus | escalation replies T09, T13, T18, T05, T17 | no refund promise and no internal words in any of them ✓ |
+| — | router on the 18 tickets (default model) | **18/18** ✓ |
+
 ## Phase 0: test harness
 
 The fake LLM in `tests/test_app.py` stands in for `ChatOpenAI`. It does these things:
@@ -41,6 +63,8 @@ Because of this fake, almost every acceptance test runs without an API key.
   ```bash
   .venv/bin/python -c "import time,bot; t=time.time(); bot.router.invoke({'input':'FK1007 ko 15 min bola tha aur 38 min lag gaye','chat_history':[]}); print(round(time.time()-t,2),'s')"
   ```
+- **Live measurement (median of 5 tickets):** the intent call alone took 0.81s; the full router, with intent and language in parallel, took 1.12s. That is a little slower, because the router waits for the *slower* of two random latencies, which is usually higher than one. It is still far less than running them one after the other (about 1.6s).
+- **Bug found in the live run, and fixed:** gpt-4o-mini labelled the Telugu ticket X3 `hindi` (4 times out of 4), and llama-3.1-8b sometimes said `hinglish`. A message written in Kannada, Telugu or Devanagari script can be labelled for certain in plain Python. So `language` is now a `RunnableBranch`: `script_language()` decides when an Indic script is present (no LLM call), and the LLM chain (`prompt | llm | StrOutputParser | parse_language`) decides only for Latin text, english vs hinglish. The prompt also got clearer, with one line per label and "no Hindi words = english". The idea is the same as Ex4: Python decides what it can know for certain. A side benefit: when the AI is down, a Kannada customer still gets the Kannada apology.
 - **Stretch (one combined `intent,sentiment,language` call vs two calls).** Not built, but this is the trade-off:
   - **Cost:** the combined call saves one full prompt per ticket. The instructions and the message are sent once instead of twice, so it costs about 40–50% fewer input tokens. Both versions cost a similar number of output tokens.
   - **Speed:** about the same, because the two calls already run in parallel.
@@ -61,6 +85,7 @@ Because of this fake, almost every acceptance test runs without an API key.
   - With both models down (401 everywhere), every ticket gets `intent=unclear` and `human_review`, and the reply is the fixed apology, for both `invoke` and `stream`.
   - With the normal setup, 18/18 still pass.
 - **Caveat found while building this:** `RunnableRetry` only wraps `invoke`/`batch`. The app *streams* the lanes, so a streamed lane never retries: it goes straight to the backup, then to the apology (`test_stream_does_not_retry_but_falls_back`). `with_fallbacks` also only helps if the error happens before the first token. A failure halfway through a stream still raises. For a short 2–3 sentence reply this is an acceptable risk.
+- **Live finding: the backup model's quality matters.** With the main model broken, every ticket is answered by `llama-3.1-8b-instruct` and gets a reply, so the acceptance test passes. But the backup routes only **11–12 of 18** correctly. It invents labels (`order_status`, `refund_issue`), which become `unclear` → `human_review`, and it tags claims such as "refund do" as `refund_status`, which routes to `info`. That is poor service, though not a money risk: none of the misroutes was a wrong `auto_refund`. With `BACKUP_MODEL=meta-llama/llama-3.3-70b-instruct`, the backup routed **18/18** in 5.9s. **Recommendation for production: a 70B backup.** I kept the exercise's suggested 8B as the default; changing it is one line in `.env`.
 - `.env.example` now has `BACKUP_MODEL`. The `RETRY_WAIT` environment variable (default 0.5s) sets the backoff; the tests set it to 0.
 
 ## Ex4: ops hand-off card for escalations
@@ -79,13 +104,14 @@ Because of this fake, almost every acceptance test runs without an API key.
 - **Watch out: what streaming prints.** `reply_chain.stream(d)` now yields dicts: `{'reply': 'Sorry'}`, `{'reply': ' to hear'}`, …, and one `{'card': {...}}` (or `{'card': None}`). `st.write_stream` cannot show those dicts. The fix is display code only: `reply_text()` in app.py yields only the `reply` strings and keeps the card on the side. The pipeline itself did not change.
 - **Knock-on fixes:** `RunnableWithMessageHistory(..., output_messages_key="reply")`, so memory stores the reply text and not the dict. The CLI prints only the reply chunks and then the card.
 - **Ops queue:** new `team`, `priority` and `summary` columns. *Why this answer?* shows the card as JSON.
+- **Live card for T09:** `{"team": "food_safety", "priority": "P1", "summary_en": "The customer reports that their daughter is experiencing vomiting and stomach pain after consuming food from order FK1009, indicating a possible food poisoning issue.", "next_step": "Escalate to food safety team for investigation."}`. On the live run the card (1.9s) ran alongside the lane reply (2.3s), so it added no waiting time.
 
 ## Ex5: bulk triage for the morning backlog
 
 - **Concepts:** `bulk_row.batch(inputs, config={"max_concurrency": 5}, return_exceptions=True)`, wrapped as `bulk_triage = RunnableLambda(wrap) | assign(results=RunnableLambda(run_batch)) | RunnableLambda(to_rows)`. `to_rows` turns each result, including exceptions, into a plain `{id, order_id, intent, language, route, reasons}` row. Language is included so ops can staff Kannada and Telugu agents.
 - **Where errors come from now.** After Ex3, an LLM failure no longer raises: the ticket becomes `unclear` → `human_review`, which is the safe place for it (`test_llm_failure_on_one_row_does_not_stop_others`). So `route = error` is for bad input. `bulk_row = RunnableLambda(require_message) | router` makes an empty or blank message fail fast, with no LLM call. `return_exceptions=True` keeps that row from stopping the other 18.
 - **UI:** the Ops tab has a CSV upload (columns `id, message`) and a **Triage** button, plus a "Triage the 18 sample tickets" button. Both show the total time, the count per route, the full table and, when the CSV has `expected_route`, the match score. The CSV is read with `dtype=str, keep_default_na=False`; otherwise an empty cell becomes the float `NaN` and the regexes crash.
-- **Batch vs loop:** with the fake LLM at 0.05s per call, `test_bulk_batch_is_at_least_2x_faster_than_a_loop` passes with a wide margin. Live numbers: `.venv/bin/python -m pytest -k test_live_bulk_triage_18_and_speed -s` prints both. The exercise author measured about 8s against 23s with `max_concurrency=5`.
+- **Batch vs loop (live, 18 tickets, `max_concurrency=5`):** a `for` loop of `router.invoke` took **26.1s**, and `bulk_triage` took **5.5s** (4.7x faster). A second run gave 27.8s vs 8.4s (3.3x). The exercise author measured about 23s vs 8s. With the fake LLM at 0.05s per call, `test_bulk_batch_is_at_least_2x_faster_than_a_loop` checks the same thing offline.
 - **Think about it: `max_concurrency=50` on a free OpenRouter key.** Free keys have tight rate limits (requests per minute). Fifty parallel calls trigger HTTP 429s almost at once. Ex3's retry backs off and tries again, so it ends up slower than 5 parallel calls, and the rows that still fail land in `human_review` as `unclear`, which floods the queue we wanted to keep small. The setting exists to stay under the provider's limit and to protect our own budget; `max_concurrency` is a throttle, not a speed dial.
 
 ## Ex6: model switcher at runtime
@@ -99,7 +125,16 @@ Because of this fake, almost every acceptance test runs without an API key.
   - Memory is keyed by session, not model, so switching mid-chat keeps the history. The test switches llama → strong and the order id is still recovered from the earlier turn.
   - A **Compare models** button runs `evaluate.batch([...], max_concurrency=1)`. That is the same `router` on the 18 tickets for each model, showing score/18, seconds, tokens, ₹ per ticket and which model really answered.
 - **Which model sent T18 ("VIP ₹2000") to `human_review`?** All of them, and no model *can* do otherwise. `claimed_amount` is a regex that reads ₹2000 from the raw text, and `decide_route` checks `amount > 1000` in plain Python, before any rule that depends on the intent. The test runs T18 with every intent label (including `general`, `refund_status` and `unclear`) on all three models: it is always `human_review`. The LLM only *labels* the message. Money and safety are decided in code, so "ignore your policy" in the message has nothing to act on.
-- **Stretch (tokens and ₹ per ticket):** `UsageMetadataCallbackHandler` is passed in `config["callbacks"]` and adds up `usage_metadata` per model name. `rupees()` multiplies by approximate OpenRouter list prices (`PRICE_USD_PER_M`, ₹88/USD). These are routing calls only (intent + language). Live numbers: `.venv/bin/python -m pytest -k test_live_compare -s`.
+- **Stretch (tokens and ₹ per ticket):** `UsageMetadataCallbackHandler` is passed in `config["callbacks"]` and adds up `usage_metadata` per model name. `rupees()` multiplies by approximate OpenRouter list prices (`PRICE_USD_PER_M`, ₹88/USD). These are routing calls only (intent + language).
+- **Live comparison** (`evaluate`, the same `router` on the 18 tickets, one model at a time):
+
+  | model | score | time | routing tokens | ≈ ₹ per ticket (routing) |
+  |---|---|---|---|---|
+  | `mini` (openai/gpt-4o-mini) | **18/18** | 6.0s | 6,603 | 0.0051 |
+  | `strong` (openai/gpt-4o) | 18/18 | 5.2s | 6,614 | 0.0855 |
+  | `llama` (meta-llama/llama-3.1-8b-instruct) | 10–12/18 | 3.7s | 7,359 | 0.0007 |
+
+  **Verdict: gpt-4o-mini is the best value.** It scores the same 18/18 as gpt-4o at about 1/17 of the cost, and both are far under the ₹2-per-ticket budget. Llama is 7x cheaper than mini but misroutes about a third of the tickets: it invents intent labels and sends claims to `info`. The ₹ saved is not worth the extra human-review load and the wrong `info` replies. During the full test run, the same comparison took 38–55s per model, because it ran right after the bulk-triage live test and the provider was throttling. On its own it takes 4–6s.
 
 ## Ex7: live pipeline tracker
 
@@ -111,6 +146,8 @@ Because of this fake, almost every acceptance test runs without an API key.
 - **Turning it off:** the listeners append to a list the *caller* passes in `config={"configurable": {"trace": [...]}}`. Without a list nothing is recorded, and the result is the same: `test_tracker_off_records_nothing_and_changes_nothing` gets 18/18 both ways with identical routes. Concurrent requests keep separate lists. The sidebar has a "Live pipeline tracker" toggle.
 - **Watch out: threads.** The listeners on the `RunnableParallel` stations run on worker threads (the test checks that `MainThread` is not among them, while `decide_route` runs on `MainThread`). So the listeners only append to the list. app.py runs `router.invoke` on a worker thread and redraws an `st.status` box from Streamlit's own thread every 0.1s until the result arrives. Then it streams the reply and redraws once more, adding the lane and the card.
 - **Sum of signal times vs total router time:** the sum is bigger, because the stations overlap. All 8 signals start together inside `RunnableParallel`: the lookups finish in milliseconds, and the router waits only as long as the slowest LLM call. With the fake LLM at 0.3s for intent and 0.3s for language, the sum is at least 0.6s while the router takes under 0.5s. The tracker prints this comparison under the station lines.
+- **Live T09 (one real run, in finish order):** the lookups (order, customer, inventory, rider, safety, amount) all finished within 0.02s. `language` took 0.72s and `intent (LLM)` 1.35s, all on worker threads and starting together. The router finished at 1.36s, then `unpack_intent` and `decide_route` took 0.00s on the main thread. After that, `lane: human_review` (2.32s, including a 1.34s `guard check`) ran in parallel with the `hand-off card` (1.92s). The **sum of the signal stations was 2.11s, against a router total of 1.36s**.
+- **Bug found in the live run, and fixed:** rows were sorted by seconds rounded to 0.01, so on a tie `router` was listed before `decide_route`. They are now sorted by the exact end time.
 - **Test-harness lesson:** with listeners attached, LangChain's tracer formats the traceback of every error. The fake used to raise the *same* exception object on every call, so its traceback grew each time and one test took 76s. The fake now builds a fresh error per call, as a real API does, and the suite is back to about 25s.
 
 ## Bonus: reply guard
@@ -124,4 +161,5 @@ Because of this fake, almost every acceptance test runs without an API key.
 - **Tuned to avoid false positives.** A decline that says "your ₹245 order was delivered more than 48 hours ago" passes, because there is no refund word in that sentence. The plain word "reason" is allowed, because the decline lane is *told* to explain the reason. The checker prompt says so too. Amount and refund words in *different* sentences pass.
 - **Templates in the customer's language** (Ex2), separately for human_review and policy_decline.
 - **Trade-off (required): the guarded lanes can no longer stream token by token.** The verdict needs the *whole* draft, so nothing can be shown until the draft is finished and checked. The customer sees the reply in one piece, about one LLM call later, and `test_guarded_stream_never_shows_the_draft` checks that the draft never reaches the screen. That is acceptable for escalations: they are a small share of tickets, a human is taking over anyway, and one wrong "₹780 today" promise costs far more, in money and legal risk, than a second of waiting. The four everyday lanes still stream.
+- **Live check:** the real escalation replies for T09, T13, T18, T05 and T17 contain no refund promise and no internal words. On T09, the `guard check` (LLM checker) took **1.34s**. That is the real price of not streaming those two lanes.
 - **Ex7 interaction:** the tracker shows a `guard check` station for the guarded lanes. Listeners only record timings, never the draft text, so the tracker cannot leak the draft either.
