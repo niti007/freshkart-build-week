@@ -267,6 +267,24 @@ def get_history(session_id):
 
 bot = RunnableWithMessageHistory(full_chain, get_history, input_messages_key="input", history_messages_key="chat_history")
 
+# Cell 23: Bulk Triage (Exercise 5)
+def run_bulk_triage(tickets_list, concurrency=5):
+    inputs = [{"input": str(t.get("message", "")), "chat_history": []} for t in tickets_list]
+    raw_results = router.batch(inputs, config={"max_concurrency": concurrency}, return_exceptions=True)
+    output = []
+    for t, res in zip(tickets_list, raw_results):
+        if isinstance(res, Exception):
+            output.append({"id": t.get("id"), "order_id": None, "intent": "error", "route": "error", "reasons": str(res)})
+        else:
+            output.append({
+                "id": t.get("id"), "order_id": res.get("order_id"),
+                "intent": res["signals"]["intent"], "route": res["route"],
+                "reasons": "; ".join(res.get("reasons", []))
+            })
+    return output
+
+bulk_triage = RunnableLambda(run_bulk_triage)
+
 if __name__ == "__main__":  # python bot.py T09
     t = next(t for t in TICKETS if t["id"] == (sys.argv[1] if len(sys.argv) > 1 else "T01"))
     print("Customer:", t["message"], "\nBot: ", end="")

@@ -1,4 +1,4 @@
-import os, uuid
+import os, uuid, time
 from datetime import datetime
 import pandas as pd
 import streamlit as st
@@ -12,7 +12,7 @@ if not os.getenv("OPENROUTER_API_KEY"):
     st.error("OPENROUTER_API_KEY is missing. Copy .env.example to .env, add your key, and restart.")
     st.stop()
 from bot import (TICKETS, orders, customers, inventory, riders, router, reply_chain, get_history,
-                 get_order, get_customer, order_id_from)
+                 get_order, get_customer, order_id_from, bulk_triage)
 
 ss = st.session_state
 ss.setdefault("sid", uuid.uuid4().hex[:8])
@@ -107,6 +107,26 @@ with tab_ops:
     else:
         st.info("No tickets sent to a human yet in this session.")
 
+    st.divider()
+    st.subheader("Bulk Triage (Morning Backlog)")
+    uploaded_file = st.file_uploader("Upload tickets CSV (columns: id, message)", type=["csv"], key="bulk_csv_upload")
+    if uploaded_file is not None:
+        df_upload = pd.read_csv(uploaded_file, dtype=str)
+        st.caption(f"Loaded {len(df_upload)} rows from CSV:")
+        st.dataframe(df_upload.head(3), use_container_width=True)
+        if st.button("Triage", key="btn_run_bulk_triage"):
+            with st.spinner(f"Triaging {len(df_upload)} tickets in parallel (concurrency=5)..."):
+                t0 = time.time()
+                triaged = bulk_triage.invoke(df_upload.to_dict("records"))
+                elapsed = time.time() - t0
+            df_triaged = pd.DataFrame(triaged)
+            st.success(f"Triaged {len(df_triaged)} tickets in {elapsed:.2f}s!")
+            route_counts = df_triaged["route"].value_counts().to_dict()
+            rc_cols = st.columns(len(route_counts))
+            for c, (rt, count) in zip(rc_cols, route_counts.items()):
+                c.metric(rt, count)
+            st.dataframe(df_triaged, use_container_width=True)
+
 with tab_data:
     for name, df in [("orders", orders), ("customers", customers), ("inventory", inventory), ("riders", riders)]:
         st.subheader(name)
@@ -144,6 +164,7 @@ with tab_how:
         ("Cell 20 Robust Lanes", "lane, backup_llm, fallback", "Streamed reply in Chat with fallback"),
         ("Cell 21 Ops Card", "card_chain, card_branch", "Ops escalation card in Chat & Queue"),
         ("Cell 22 Memory", "full_chain, store, get_history", "New chat button"),
+        ("Cell 23 Bulk Triage", "bulk_triage", "Ops queue bulk CSV triage"),
         ("Cell 24 Evaluation", "router", "Sample ticket + Send"),
     ], columns=["Notebook cell", "bot.py", "App widget"]))
 
