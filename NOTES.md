@@ -62,3 +62,20 @@ Because of this fake, almost every acceptance test runs without an API key.
   - With the normal setup, 18/18 still pass.
 - **Caveat found while building this:** `RunnableRetry` only wraps `invoke`/`batch`. The app *streams* the lanes, so a streamed lane never retries: it goes straight to the backup, then to the apology (`test_stream_does_not_retry_but_falls_back`). `with_fallbacks` also only helps if the error happens before the first token. A failure halfway through a stream still raises. For a short 2–3 sentence reply this is an acceptable risk.
 - `.env.example` now has `BACKUP_MODEL`. The `RETRY_WAIT` environment variable (default 0.5s) sets the backoff; the tests set it to 0.
+
+## Ex4: ops hand-off card for escalations
+
+- **Concepts:**
+  - `reply_chain = add_note | RunnableParallel(reply=branch, card=card_branch)`.
+  - `card_branch = RunnableBranch((route == "human_review", card_chain), RunnableLambda(lambda x: None))`.
+  - `card_chain = assign(raw=card_prompt | llm | JsonOutputParser()) | RunnableLambda(check_card)`, with a Python default card as the fallback.
+- **Design choice: after the branch, not inside the human_review lane.** The card needs the same input as the lanes (note, chat history, masked text) but not the reply, so it runs *next to* the chosen lane. The six lanes stay identical and keep the same Ex3 fallback wrapping. The card can also be turned off in one place.
+- **The LLM is not trusted with business values:**
+  - `check_card` keeps `team` and `priority` only when they are valid labels; otherwise they become `support` and `P2`.
+  - When `decide_route` already knows the reason (food safety, payment issue, rider misconduct), Python sets the team and priority, whatever the LLM wrote. T09 and X4 always get `food_safety/P1`, T13 `finance`, T10 `rider_ops`.
+  - Bad JSON, a wrong shape or an LLM outage gives a default card. It never crashes, on either `invoke` or `stream`.
+- **The card sees the whole chat.** The card prompt gets the masked `chat_history`, so a multi-turn escalation is summarised in full. It is masked by Ex1, like everything else.
+- **"Prove no extra LLM call for T01":** `test_t01_no_card_and_no_extra_llm_call` counts the fake LLM's calls. There are exactly 3 (intent, language, lane) and none for the card. The `RunnableBranch` returns `None` before any prompt is built.
+- **Watch out: what streaming prints.** `reply_chain.stream(d)` now yields dicts: `{'reply': 'Sorry'}`, `{'reply': ' to hear'}`, …, and one `{'card': {...}}` (or `{'card': None}`). `st.write_stream` cannot show those dicts. The fix is display code only: `reply_text()` in app.py yields only the `reply` strings and keeps the card on the side. The pipeline itself did not change.
+- **Knock-on fixes:** `RunnableWithMessageHistory(..., output_messages_key="reply")`, so memory stores the reply text and not the dict. The CLI prints only the reply chunks and then the card.
+- **Ops queue:** new `team`, `priority` and `summary` columns. *Why this answer?* shows the card as JSON.

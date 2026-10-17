@@ -124,6 +124,12 @@ def wrong_routes(results, tickets=TICKETS):
     """The regression check used after every exercise: ids of tickets whose route is not the expected one."""
     return [t["id"] for t, r in zip(tickets, results) if r["route"] != t["expected_route"]]
 
+def reply(bot, d):
+    return bot.reply_chain.invoke(d)["reply"]
+
+def streamed(bot, d):
+    return "".join(chunk.get("reply", "") for chunk in bot.reply_chain.stream(d))
+
 def decide(bot, msg, history=()):
     return bot.router.invoke({"input": msg, "chat_history": list(history)})
 
@@ -219,7 +225,7 @@ def test_router_output_shape(fake_bot):
 @pytest.mark.parametrize("tid", [t["id"] for t in TICKETS])
 def test_each_route_uses_its_lane(fake_bot, tid):
     d = decide(fake_bot, BY_ID[tid]["message"])
-    assert fake_bot.reply_chain.invoke(d) == "Fake reply."
+    assert reply(fake_bot, d) == "Fake reply."
     assert fake_bot.LANES[d["route"]] in calls("lane")[-1]["system"]
 
 # ---- offline: rules and router ----
@@ -335,12 +341,12 @@ def test_x1_intent_prompt_text_via_to_string(fake_bot):
 
 def test_no_llm_call_ever_sees_raw_pii(fake_bot):
     d = decide(fake_bot, X["X1"])
-    fake_bot.reply_chain.invoke(d)
+    reply(fake_bot, d)
     text = " ".join(m.content for c in calls() for m in c["messages"])
     assert calls("lane") and not any(p in text for p in PII_RAW)
 
 def test_lane_prompt_reads_masked_input(fake_bot):
-    fake_bot.reply_chain.invoke(decide(fake_bot, X["X1"]))
+    reply(fake_bot, decide(fake_bot, X["X1"]))
     assert calls("lane")[-1]["human"].startswith("Please call me on [PHONE]")
 
 def test_history_is_masked_but_order_id_still_recovered(fake_bot):
@@ -348,7 +354,7 @@ def test_history_is_masked_but_order_id_still_recovered(fake_bot):
     d = decide(fake_bot, "refund kab milega?", hist)
     assert d["order_id"] == "FK1016"
     assert "9845012345" not in d["chat_history"][0].content and "[PHONE]" in d["chat_history"][0].content
-    fake_bot.reply_chain.invoke(d)
+    reply(fake_bot, d)
     assert "9845012345" not in " ".join(m.content for m in calls("lane")[-1]["messages"])
     assert hist[0].content.endswith("9845012345")  # the caller's history object is not modified
 
@@ -410,20 +416,20 @@ def test_x2_kannada_wismo_with_coupon(fake_bot):
     assert d["route"] == "wismo" and d["signals"]["language"] == "kannada"
     noted = fake_bot.add_note(d)
     assert noted["language"] == "kannada" and "Rs 50 coupon" in noted["note"]
-    fake_bot.reply_chain.invoke(d)
+    reply(fake_bot, d)
     assert "Reply in kannada" in calls("lane")[-1]["system"] and "Rs 50 coupon" in calls("lane")[-1]["system"]
 
 def test_x3_telugu_reply_language(fake_bot):
     d = decide(fake_bot, X["X3"])
     assert d["signals"]["language"] == "telugu" and d["order_id"] == "FK1003"
-    fake_bot.reply_chain.invoke(d)
+    reply(fake_bot, d)
     assert "Reply in telugu" in calls("lane")[-1]["system"]
 
 def test_other_language_replies_in_english(fake_bot):
     FAKE["script"]["language"] = lambda call: "other"
     d = decide(fake_bot, "Bonjour, ma commande FK1006?")
     assert d["signals"]["language"] == "other" and fake_bot.add_note(d)["language"] == "english"
-    fake_bot.reply_chain.invoke(d)
+    reply(fake_bot, d)
     assert "Reply in english" in calls("lane")[-1]["system"]
 
 def test_language_does_not_change_routes(fake_bot):
@@ -456,13 +462,13 @@ KANNADA, TELUGU = re.compile("[ಀ-೿]"), re.compile("[ఀ-౿]")
 def test_live_x2_kannada_reply_with_coupon(real_bot):
     d = decide(real_bot, X["X2"])
     assert d["signals"]["language"] == "kannada" and d["route"] == "wismo"
-    reply = real_bot.reply_chain.invoke(d)
-    assert KANNADA.search(reply) and "50" in reply
+    text = reply(real_bot, d)
+    assert KANNADA.search(text) and "50" in text
 
 @live
 def test_live_x3_telugu_reply(real_bot):
     d = decide(real_bot, X["X3"])
-    assert d["signals"]["language"] == "telugu" and TELUGU.search(real_bot.reply_chain.invoke(d))
+    assert d["signals"]["language"] == "telugu" and TELUGU.search(reply(real_bot, d))
 
 @live
 def test_live_t01_hinglish(real_bot):
@@ -532,12 +538,12 @@ def test_main_model_missing_all_18_still_answered_by_backup(broken_main_bot):
     assert not wrong_routes(results)
     assert {r["signals"]["intent_model"] for r in results} == {BACKUP}
     for r in results:
-        assert broken_main_bot.reply_chain.invoke(r) == "Fake reply."
+        assert reply(broken_main_bot, r) == "Fake reply."
     assert [c["model"] for c in calls("lane")] == [BROKEN, BACKUP] * 18  # main tried once (404: no retry), then backup
 
 def test_main_model_missing_stream_uses_backup(broken_main_bot):
     d = decide(broken_main_bot, BY_ID["T01"]["message"])
-    assert "".join(broken_main_bot.reply_chain.stream(d)) == "Fake reply."
+    assert streamed(broken_main_bot, d) == "Fake reply."
 
 def test_both_models_down_unclear_human_review_apology(fake_bot):
     FAKE["fail"]["*"] = auth_error()
@@ -545,8 +551,8 @@ def test_both_models_down_unclear_human_review_apology(fake_bot):
     for r in results:
         assert r["signals"]["intent"] == "unclear" and r["signals"]["intent_model"] == "none (AI down)"
         assert r["signals"]["language"] == "english" and r["route"] == "human_review"
-        assert fake_bot.reply_chain.invoke(r) == fake_bot.APOLOGY["english"]
-    assert "".join(fake_bot.reply_chain.stream(results[0])) == fake_bot.APOLOGY["english"]
+        assert reply(fake_bot, r) == fake_bot.APOLOGY["english"]
+    assert streamed(fake_bot, results[0]) == fake_bot.APOLOGY["english"]
 
 def test_both_down_unclear_reason(fake_bot):
     FAKE["fail"]["*"] = timeout_error()
@@ -556,7 +562,7 @@ def test_both_down_unclear_reason(fake_bot):
 def test_apology_in_customer_language(fake_bot):
     FAKE["script"]["lane"] = boom(auth_error)
     d = decide(fake_bot, X["X2"])
-    assert fake_bot.reply_chain.invoke(d) == fake_bot.APOLOGY["kannada"]
+    assert reply(fake_bot, d) == fake_bot.APOLOGY["kannada"]
     assert fake_bot.apology({"language": "other"}) == fake_bot.APOLOGY["english"]
     assert fake_bot.apology({}) == fake_bot.APOLOGY["english"]
 
@@ -569,14 +575,14 @@ def test_stream_does_not_retry_but_falls_back(fake_bot):
     d = decide(fake_bot, BY_ID["T01"]["message"])
     FAKE["calls"].clear()
     FAKE["fail"][MAIN] = [timeout_error()]
-    assert "".join(fake_bot.reply_chain.stream(d)) == "Fake reply."
+    assert streamed(fake_bot, d) == "Fake reply."
     assert [c["model"] for c in calls("lane")] == [MAIN, BACKUP]  # documented: RunnableRetry does not wrap .stream
 
 def test_invoke_retries_the_lane(fake_bot):
     d = decide(fake_bot, BY_ID["T01"]["message"])
     FAKE["calls"].clear()
     FAKE["fail"][MAIN] = [timeout_error()]
-    assert fake_bot.reply_chain.invoke(d) == "Fake reply."
+    assert reply(fake_bot, d) == "Fake reply."
     assert [c["model"] for c in calls("lane")] == [MAIN, MAIN]
 
 def test_no_try_except_in_bot():
@@ -603,7 +609,7 @@ def test_live_bad_main_model_uses_backup(monkeypatch):
     bot = load_bot(monkeypatch, fake=False)
     d = decide(bot, BY_ID["T01"]["message"])
     assert "llama" in d["signals"]["intent_model"] and d["route"] == "auto_refund"
-    assert bot.reply_chain.invoke(d).strip()
+    assert reply(bot, d).strip()
     sys.modules.pop("bot", None)
 
 @live
@@ -612,8 +618,137 @@ def test_live_wrong_key_is_unclear_human_review_apology(monkeypatch):
     bot = load_bot(monkeypatch, fake=False)
     d = decide(bot, BY_ID["T01"]["message"])
     assert d["signals"]["intent"] == "unclear" and d["route"] == "human_review"
-    assert bot.reply_chain.invoke(d) == bot.APOLOGY["english"]
+    assert reply(bot, d) == bot.APOLOGY["english"]
     sys.modules.pop("bot", None)
+
+# ---- Ex4: ops hand-off card ----
+CARD_KEYS = {"team", "priority", "summary_en", "next_step"}
+
+def card_of(bot, msg, history=()):
+    return bot.reply_chain.invoke(decide(bot, msg, history))["card"]
+
+@pytest.mark.parametrize("tid,team,priority", [
+    ("T09", "food_safety", "P1"), ("T13", "finance", "P2"), ("T10", "rider_ops", "P2"),
+])
+def test_card_team_and_priority_for_known_reasons(fake_bot, tid, team, priority):
+    card = card_of(fake_bot, BY_ID[tid]["message"])  # the fake LLM says support/P3: Python rules win
+    assert card["team"] == team and card["priority"] == priority and set(card) == CARD_KEYS
+
+def test_x4_hinglish_food_safety_p1(fake_bot):
+    card = card_of(fake_bot, X["X4"])
+    assert (card["team"], card["priority"]) == ("food_safety", "P1")
+    assert "summary_en is one sentence in English" in calls("card")[-1]["system"]
+
+def test_card_uses_llm_team_for_other_escalations(fake_bot):
+    FAKE["script"]["card"] = lambda call: ('{"team": "finance", "priority": "P2", "summary_en": "Amount above limit.",'
+                                           ' "next_step": "Check the order value."}')
+    card = card_of(fake_bot, BY_ID["T18"]["message"])  # amount>1000: no fixed team
+    assert card == {"team": "finance", "priority": "P2", "summary_en": "Amount above limit.", "next_step": "Check the order value."}
+
+@pytest.mark.parametrize("raw,team,priority", [
+    ('{"team": "aliens", "priority": "P9", "summary_en": "x", "next_step": "y"}', "support", "P2"),
+    ('{"team": "rider_ops", "priority": "P1", "summary_en": "x", "next_step": "y"}', "rider_ops", "P1"),
+    ('{"team": "FINANCE", "priority": "p2", "summary_en": "x", "next_step": "y"}', "support", "P2"),
+])
+def test_card_values_are_checked_in_python(fake_bot, raw, team, priority):
+    FAKE["script"]["card"] = lambda call: raw
+    card = card_of(fake_bot, BY_ID["T18"]["message"])
+    assert (card["team"], card["priority"]) == (team, priority)
+
+@pytest.mark.parametrize("raw", ["not json at all", "[1, 2, 3]", '"just a string"', '{"team": "finance"}'])
+def test_bad_card_answers_never_crash(fake_bot, raw):
+    FAKE["script"]["card"] = lambda call: raw
+    d = decide(fake_bot, BY_ID["T09"]["message"])
+    for card in [fake_bot.reply_chain.invoke(d)["card"],
+                 next(c["card"] for c in fake_bot.reply_chain.stream(d) if "card" in c)]:
+        assert set(card) == CARD_KEYS and (card["team"], card["priority"]) == ("food_safety", "P1")
+        assert card["summary_en"] and card["next_step"]
+
+def test_check_card_unit(fake_bot):
+    x = {"reasons": ["amount>1000"], "raw": {"team": "support", "priority": "P3", "summary_en": "", "next_step": None}}
+    card = fake_bot.check_card(x)
+    assert card["summary_en"] == "Card not generated by AI; read the chat." and card["next_step"]
+    assert fake_bot.check_card({"reasons": ["food safety"], "raw": None})["team"] == "food_safety"
+
+def test_card_llm_down_gives_default_card(fake_bot):
+    FAKE["script"]["card"] = boom(auth_error)
+    card = card_of(fake_bot, BY_ID["T13"]["message"])
+    assert card["team"] == "finance" and card["summary_en"].startswith("Card not generated")
+
+def test_t01_no_card_and_no_extra_llm_call(fake_bot):
+    out = fake_bot.reply_chain.invoke(decide(fake_bot, BY_ID["T01"]["message"]))
+    assert out == {"reply": "Fake reply.", "card": None}
+    assert calls("card") == [] and [c["kind"] for c in calls()].count("lane") == 1
+    assert len(calls()) == 3  # intent + language + lane, nothing else
+
+def test_only_human_review_gets_cards(fake_bot):
+    for t in TICKETS:
+        card = card_of(fake_bot, t["message"])
+        if t["expected_route"] == "human_review":
+            assert set(card) == CARD_KEYS and card["team"] in fake_bot.TEAMS and card["priority"] in fake_bot.PRIORITIES
+        else:
+            assert card is None
+    assert len(calls("card")) == sum(t["expected_route"] == "human_review" for t in TICKETS)
+
+def test_card_prompt_sees_masked_text_note_and_history(fake_bot):
+    hist = [HumanMessage(content="FK1009 ki biryani kharab thi, call 9845012345"), AIMessage(content="Sorry to hear.")]
+    card_of(fake_bot, "ab bacche ko ulti ho rahi hai", hist)
+    c = calls("card")[-1]
+    text = " ".join(m.content for m in c["messages"])
+    assert "biryani" in text and "[PHONE]" in text and "9845012345" not in text
+    assert "order=FK1009" in c["system"] and "reasons=['food safety']" in c["system"]
+
+def test_stream_yields_reply_text_then_one_card(fake_bot):
+    chunks = list(fake_bot.reply_chain.stream(decide(fake_bot, BY_ID["T09"]["message"])))
+    cards = [c["card"] for c in chunks if "card" in c]
+    assert "".join(c.get("reply", "") for c in chunks) == "Fake reply."
+    assert len(cards) == 1 and cards[0]["team"] == "food_safety"
+    none_chunks = [c for c in fake_bot.reply_chain.stream(decide(fake_bot, BY_ID["T01"]["message"])) if "card" in c]
+    assert none_chunks == [{"card": None}]
+
+def test_reply_and_card_run_in_parallel(fake_bot):
+    d = decide(fake_bot, BY_ID["T09"]["message"])
+    FAKE["delay"].update(lane=0.4, card=0.4)
+    t0 = time.perf_counter()
+    fake_bot.reply_chain.invoke(d)
+    assert time.perf_counter() - t0 < 0.7
+
+def test_memory_stores_reply_text_not_dict(fake_bot):
+    cfg = {"configurable": {"session_id": "ex4"}}
+    out = fake_bot.bot.invoke({"input": BY_ID["T09"]["message"]}, config=cfg)
+    assert out["reply"] == "Fake reply." and out["card"]["team"] == "food_safety"
+    assert [m.content for m in fake_bot.get_history("ex4").messages] == [BY_ID["T09"]["message"], "Fake reply."]
+    chunks = list(fake_bot.bot.stream({"input": "aur kab tak?"}, config=cfg))
+    assert "".join(c.get("reply", "") for c in chunks) == "Fake reply." and len(fake_bot.get_history("ex4").messages) == 4
+
+def test_ui_shows_card_and_ops_columns(fake_bot):
+    at = app()
+    at.chat_input[0].set_value(BY_ID["T09"]["message"]).run()
+    assert not at.exception
+    assert at.chat_message[1].markdown[0].value == "Fake reply."  # text, not a dict
+    assert any("Hand-off card" in md.value for md in at.expander[0].markdown)
+    assert at.session_state["messages"][1]["card"]["team"] == "food_safety"
+    queue = at.dataframe[0].value
+    assert {"team", "priority", "summary"} <= set(queue.columns) and queue["team"].tolist() == ["food_safety"]
+
+def test_ui_no_card_for_auto_refund(fake_bot):
+    at = app()
+    at.chat_input[0].set_value(BY_ID["T01"]["message"]).run()
+    assert not any("Hand-off card" in md.value for md in at.expander[0].markdown)
+    assert at.session_state["messages"][1]["card"] is None
+
+ASCII_SENTENCE = re.compile(r"^[\x00-\x7F₹]+$")
+
+@live
+@pytest.mark.parametrize("tid,team", [("T09", "food_safety"), ("T13", "finance"), ("T10", "rider_ops")])
+def test_live_cards(real_bot, tid, team):
+    card = card_of(real_bot, BY_ID[tid]["message"])
+    assert card["team"] == team and ASCII_SENTENCE.match(card["summary_en"])
+
+@live
+def test_live_x4_card_summary_in_english(real_bot):
+    card = card_of(real_bot, X["X4"])
+    assert (card["team"], card["priority"]) == ("food_safety", "P1") and ASCII_SENTENCE.match(card["summary_en"])
 
 # ---- live (real OpenRouter calls) ----
 @live

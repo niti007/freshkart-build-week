@@ -30,6 +30,15 @@ def why(m):
         if m.get("pii_count"):
             st.markdown(f":shield: PII masked: **{m['pii_count']} items** (before any prompt)")
         st.json(m["signals"])
+        if m.get("card"):
+            st.markdown("**Hand-off card** (for the senior agent)")
+            st.json(m["card"])
+
+def reply_text(chunks, out):
+    """reply_chain streams {"reply": text} chunks and one {"card": ...} chunk: show the text, keep the card."""
+    for chunk in chunks:
+        if chunk.get("reply"): yield chunk["reply"]
+        if "card" in chunk: out["card"] = chunk["card"]
 
 # Sidebar
 sample = None
@@ -58,10 +67,12 @@ with tab_chat:
         with st.chat_message("assistant"):
             with st.spinner("Checking order, customer and policy..."):
                 decision = router.invoke({"input": msg, "chat_history": history.messages})
-            reply = st.write_stream(reply_chain.stream(decision))
+            out = {}
+            reply = st.write_stream(reply_text(reply_chain.stream(decision), out))
+            card = out.get("card")
             m = {"role": "assistant", "content": reply, "route": decision["route"],
                  "reasons": decision["reasons"], "signals": decision["signals"],
-                 "pii_count": decision["pii_count"]}
+                 "pii_count": decision["pii_count"], "card": card}
             why(m)
         history.add_user_message(msg)
         history.add_ai_message(reply)
@@ -69,7 +80,9 @@ with tab_chat:
         ss.log.append({"time": datetime.now().strftime("%H:%M:%S"), "order_id": decision["order_id"],
                        "intent": decision["signals"]["intent"], "language": decision["signals"]["language"],
                        "route": decision["route"],
-                       "reasons": "; ".join(decision["reasons"]), "message": msg})
+                       "reasons": "; ".join(decision["reasons"]), "message": msg,
+                       "team": (card or {}).get("team"), "priority": (card or {}).get("priority"),
+                       "summary": (card or {}).get("summary_en")})
 
 with tab_ops:
     cols = st.columns(len(COLORS))
@@ -105,6 +118,7 @@ with tab_how:
  RunnableBranch: auto_refund | wismo | substitution | info | policy_decline | human_review
         |
  StrOutputParser -> streamed reply in the customer's language   (memory: RunnableWithMessageHistory)
+        +  in parallel (Ex4): human_review only -> card_prompt | llm | JsonOutputParser -> hand-off card
 """, language="text")
     st.table(pd.DataFrame([
         ("Cell 2 Setup", "get_llm, read", "Data tab"),
