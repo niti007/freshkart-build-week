@@ -31,3 +31,18 @@ Because of this fake, almost every acceptance test runs without an API key.
 - **Beyond the spec:** earlier turns in `chat_history` are masked too. Otherwise a phone number from turn 1 would still reach the lane prompt in turn 2. Order ids survive masking, so memory still finds them. The stored history keeps the raw text in memory, but only the masked copy ever goes into a prompt.
 - **Proof** (`test_x1_intent_prompt_is_masked_but_routing_unchanged`, `test_no_llm_call_ever_sees_raw_pii`). For X1, the intent prompt receives `Please call me on [PHONE] or mail [EMAIL], UPI [UPI]. FK1001 mein Britannia bread missing tha, refund do.` The route stays `auto_refund`.
 - **Stretch done:** "PII masked: N items" shows in *Why this answer?*. The count comes from the pipeline (`pii_count`); app.py only displays it.
+
+## Ex2: language signal and replying in the customer's language
+
+- **Concept:** a new `language` key on the existing `RunnableParallel`, built as `masked | language_prompt | llm | StrOutputParser() | RunnableLambda(parse_language)`. `parse_language` takes the first word and falls back to `"english"` for anything outside the six labels, the same pattern as `parse_intent`.
+- **Passed to the lanes by `add_note`**, which adds `language` to the box, with `other` mapped to `english`. The lane system prompt now says `Reply in {language}`.
+- **Display:** a `Language:` line in *Why this answer?* (it is also in the signals JSON), and a `language` column in the Ops queue.
+- **Think about it: did the router get slower?** Barely. `RunnableParallel` starts the language call at the same time as the intent call, so the router waits for the slower of the two, not their sum. The test `test_language_runs_in_parallel_with_intent` gives each fake call a 0.4s delay: the router takes about 0.4s, where running them one after the other would take 0.8s or more. To measure it live, once a key is in `.env`:
+  ```bash
+  .venv/bin/python -c "import time,bot; t=time.time(); bot.router.invoke({'input':'FK1007 ko 15 min bola tha aur 38 min lag gaye','chat_history':[]}); print(round(time.time()-t,2),'s')"
+  ```
+- **Stretch (one combined `intent,sentiment,language` call vs two calls).** Not built, but this is the trade-off:
+  - **Cost:** the combined call saves one full prompt per ticket. The instructions and the message are sent once instead of twice, so it costs about 40–50% fewer input tokens. Both versions cost a similar number of output tokens.
+  - **Speed:** about the same, because the two calls already run in parallel.
+  - **Risk:** with one prompt doing two jobs, a parse error loses both labels at once.
+  - **Verdict:** under a ₹2-per-ticket budget, the combined call is the one to ship. Ex6's token counter can confirm the numbers.

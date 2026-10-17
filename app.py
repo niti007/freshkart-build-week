@@ -25,6 +25,7 @@ def why(m):
     with st.expander("Why this answer?"):
         st.markdown(f"Route: :{COLORS[m['route']]}[**{m['route']}**]")
         st.markdown("Reasons: " + "; ".join(m["reasons"]))
+        st.markdown(f"Language: **{m['signals'].get('language', 'english')}**")
         if m.get("pii_count"):
             st.markdown(f":shield: PII masked: **{m['pii_count']} items** (before any prompt)")
         st.json(m["signals"])
@@ -65,7 +66,8 @@ with tab_chat:
         history.add_ai_message(reply)
         ss.messages += [{"role": "user", "content": msg}, m]
         ss.log.append({"time": datetime.now().strftime("%H:%M:%S"), "order_id": decision["order_id"],
-                       "intent": decision["signals"]["intent"], "route": decision["route"],
+                       "intent": decision["signals"]["intent"], "language": decision["signals"]["language"],
+                       "route": decision["route"],
                        "reasons": "; ".join(decision["reasons"]), "message": msg})
 
 with tab_ops:
@@ -93,13 +95,13 @@ with tab_how:
  RunnableLambda(find_order_id)        regex: FK1001 / fk1001 / ord_1001
         |
  RunnablePassthrough.assign(signals = RunnableParallel(
-        intent (LLM) | order | customer | inventory | rider | safety | claimed_amount ))
+        intent (LLM) | language (LLM, Ex2) | order | customer | inventory | rider | safety | claimed_amount ))
         |
  RunnableLambda(decide_route)         plain Python rules, no LLM
         |
  RunnableBranch: auto_refund | wismo | substitution | info | policy_decline | human_review
         |
- StrOutputParser -> streamed reply     (memory: RunnableWithMessageHistory)
+ StrOutputParser -> streamed reply in the customer's language   (memory: RunnableWithMessageHistory)
 """, language="text")
     st.table(pd.DataFrame([
         ("Cell 2 Setup", "get_llm, read", "Data tab"),

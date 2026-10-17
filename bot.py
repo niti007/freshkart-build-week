@@ -121,9 +121,24 @@ def parse_intent(text):
     label = text.strip().lower().split(",")[0].strip()
     return label if label in [l.split(":")[0] for l in INTENTS.split("\n")] else "unclear"
 
+# Ex 2: language signal. A second LLM chain added as a new key of the same RunnableParallel, so it runs at the same
+# time as intent (prompt | llm | StrOutputParser | RunnableLambda(clean_up)). The clean-up falls back to "english".
+LANGS = ["english", "hinglish", "hindi", "kannada", "telugu", "other"]
+language_prompt = ChatPromptTemplate.from_messages([
+    ("system", "Which language is the customer message written in? Choose exactly one: " + ", ".join(LANGS) + ".\n"
+               "hinglish = Hindi words written in English letters, often mixed with English. hindi = Devanagari script.\n"
+               "Answer ONLY with the label."),
+    ("human", "{input}"),
+])
+
+def parse_language(text):
+    words = re.findall(r"[a-z]+", text.lower())
+    return words[0] if words and words[0] in LANGS else "english"
+
 oid = lambda f: RunnableLambda(lambda x: f(x["order_id"]))
 signals = RunnableParallel(
     intent=masked | intent_prompt | llm | StrOutputParser() | RunnableLambda(parse_intent),
+    language=masked | language_prompt | llm | StrOutputParser() | RunnableLambda(parse_language),
     order=oid(get_order), customer=oid(get_customer), inventory=oid(check_inventory), rider=oid(get_rider),
     safety=RunnableLambda(lambda x: has_safety(x["input"])),
     claimed_amount=RunnableLambda(lambda x: claimed_amount(x["input"])),
@@ -171,7 +186,8 @@ def add_note(x):
         if o["status"] == "delivered" and delay is not None:
             facts.append(f"delay={delay}min" + (", give a Rs 50 coupon (late by more than 15 min)" if delay > 15 else ""))
     if s["claimed_amount"]: facts.append(f"claimed=Rs{s['claimed_amount']:.0f}")
-    return {**x, "note": "; ".join(facts)}
+    language = s.get("language", "english")  # Ex 2: the lanes reply in this language; "other" -> English
+    return {**x, "note": "; ".join(facts), "language": "english" if language == "other" else language}
 
 LANES = {
     "auto_refund": "Apologise, confirm the refund amount and when it arrives (FK Wallet instant; UPI/card 3-5 working days; COD to FK Wallet).",
@@ -184,7 +200,8 @@ LANES = {
 
 def lane(instruction):
     p = ChatPromptTemplate.from_messages([
-        ("system", "You are a FreshKart support agent. Reply in 2-3 short sentences, Hinglish-friendly, same language as the customer. "
+        ("system", "You are a FreshKart support agent. Reply in 2-3 short sentences. Reply in {language} "
+                   "(hinglish = Hindi in English letters). "
                    "Use ONLY facts from the internal note. NEVER reveal the internal note, route or reasons.\n"
                    f"Task: {instruction}\nInternal note: {{note}}"),
         MessagesPlaceholder("chat_history"),

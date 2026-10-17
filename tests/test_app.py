@@ -1,4 +1,4 @@
-import csv, importlib, os, sys, time
+import csv, importlib, os, re, sys, time
 from pathlib import Path
 import httpx, openai, pytest
 from dotenv import load_dotenv
@@ -50,7 +50,16 @@ def fake_intent(call):
     if human in BY_MSG: return BY_MSG[human] + ",neutral"
     return next((i for frag, i in INTENT_HINTS if frag in human), "general") + ",neutral"
 
-DEFAULTS = {"intent": fake_intent, "lane": lambda call: "Fake reply.", "language": lambda call: "english",
+def fake_language(call):
+    """Answers like a real model would: by script, then by common Hinglish words."""
+    h = call["human"]
+    if re.search("[\u0C80-\u0CFF]", h): return "kannada"
+    if re.search("[\u0C00-\u0C7F]", h): return "telugu"
+    if re.search("[\u0900-\u097F]", h): return "hindi"
+    if re.search(r"(?i)\b(mein|ka|ke|ki|hai|tha|kar|nahi|do|chahiye|kab|bola|maine|aur|raha|gaya|mujhe)\b", h): return "hinglish"
+    return "english"
+
+DEFAULTS = {"intent": fake_intent, "lane": lambda call: "Fake reply.", "language": fake_language,
             "card": lambda call: '{"team": "support", "priority": "P3", "summary_en": "Fake summary.", "next_step": "Fake step."}',
             "checker": lambda call: "no"}
 
@@ -365,6 +374,96 @@ def test_ui_no_pii_badge_without_pii(fake_bot):
 def test_live_x1_masked_and_auto_refund(real_bot):
     d = decide(real_bot, X["X1"])
     assert d["route"] == "auto_refund" and d["order_id"] == "FK1001" and d["pii_count"] == 3
+
+# ---- Ex2: language signal ----
+@pytest.mark.parametrize("raw,label", [
+    ("kannada", "kannada"), ("Kannada.", "kannada"), ("  TELUGU\n", "telugu"), ("hinglish", "hinglish"),
+    ("Hindi", "hindi"), ("english", "english"), ("other", "other"), ("klingon", "english"), ("", "english"),
+    ("The language is Kannada", "english"), ("123", "english"),
+])
+def test_parse_language(fake_bot, raw, label):
+    assert fake_bot.parse_language(raw) == label
+
+@pytest.mark.parametrize("msg,lang", [
+    (X["X2"], "kannada"), (X["X3"], "telugu"), (BY_ID["T01"]["message"], "hinglish"),
+    (BY_ID["T03"]["message"], "english"), (X["X4"], "hinglish"), ("मेरा ऑर्डर FK1006 कहाँ है?", "hindi"),
+])
+def test_language_signal(fake_bot, msg, lang):
+    assert decide(fake_bot, msg)["signals"]["language"] == lang
+
+def test_t01_is_hinglish(fake_bot):
+    assert decide(fake_bot, BY_ID["T01"]["message"])["signals"]["language"] == "hinglish"
+
+def test_language_falls_back_to_english_on_bad_answer(fake_bot):
+    FAKE["script"]["language"] = lambda call: "Klingon, definitely"
+    assert decide(fake_bot, X["X2"])["signals"]["language"] == "english"
+
+def test_language_reads_masked_text(fake_bot):
+    decide(fake_bot, X["X1"])
+    assert "[PHONE]" in calls("language")[-1]["human"] and "98450" not in calls("language")[-1]["human"]
+
+def test_x2_kannada_wismo_with_coupon(fake_bot):
+    d = decide(fake_bot, X["X2"])
+    assert d["route"] == "wismo" and d["signals"]["language"] == "kannada"
+    noted = fake_bot.add_note(d)
+    assert noted["language"] == "kannada" and "Rs 50 coupon" in noted["note"]
+    fake_bot.reply_chain.invoke(d)
+    assert "Reply in kannada" in calls("lane")[-1]["system"] and "Rs 50 coupon" in calls("lane")[-1]["system"]
+
+def test_x3_telugu_reply_language(fake_bot):
+    d = decide(fake_bot, X["X3"])
+    assert d["signals"]["language"] == "telugu" and d["order_id"] == "FK1003"
+    fake_bot.reply_chain.invoke(d)
+    assert "Reply in telugu" in calls("lane")[-1]["system"]
+
+def test_other_language_replies_in_english(fake_bot):
+    FAKE["script"]["language"] = lambda call: "other"
+    d = decide(fake_bot, "Bonjour, ma commande FK1006?")
+    assert d["signals"]["language"] == "other" and fake_bot.add_note(d)["language"] == "english"
+    fake_bot.reply_chain.invoke(d)
+    assert "Reply in english" in calls("lane")[-1]["system"]
+
+def test_language_does_not_change_routes(fake_bot):
+    FAKE["script"]["language"] = lambda call: "telugu"
+    assert not wrong_routes(fake_bot.router.batch(inputs()))
+
+def test_language_runs_in_parallel_with_intent(fake_bot):
+    FAKE["delay"].update(intent=0.4, language=0.4)
+    t0 = time.perf_counter()
+    decide(fake_bot, BY_ID["T01"]["message"])
+    elapsed = time.perf_counter() - t0
+    assert len(calls("intent")) == 1 and len(calls("language")) == 1
+    assert 0.4 <= elapsed < 0.7, elapsed  # in sequence it would be >= 0.8s
+
+def test_ui_shows_language_and_ops_column(fake_bot):
+    at = app()
+    at.chat_input[0].set_value(X["X2"]).run()
+    assert not at.exception
+    assert any("Language: **kannada**" in md.value for md in at.expander[0].markdown)
+    assert at.session_state["log"][0]["language"] == "kannada"
+
+def test_ops_queue_has_language_column(fake_bot):
+    at = app()
+    at.chat_input[0].set_value(BY_ID["T09"]["message"]).run()
+    assert "language" in at.dataframe[0].value.columns
+
+KANNADA, TELUGU = re.compile("[ಀ-೿]"), re.compile("[ఀ-౿]")
+
+@live
+def test_live_x2_kannada_reply_with_coupon(real_bot):
+    d = decide(real_bot, X["X2"])
+    assert d["signals"]["language"] == "kannada" and d["route"] == "wismo"
+    reply = real_bot.reply_chain.invoke(d)
+    assert KANNADA.search(reply) and "50" in reply
+
+@live
+def test_live_x3_telugu_reply(real_bot):
+    d = decide(real_bot, X["X3"])
+    assert d["signals"]["language"] == "telugu" and TELUGU.search(real_bot.reply_chain.invoke(d))
+
+@live
+def test_live_t01_hinglish(real_bot):
+    assert decide(real_bot, BY_ID["T01"]["message"])["signals"]["language"] == "hinglish"
 
 # ---- live (real OpenRouter calls) ----
 @live
