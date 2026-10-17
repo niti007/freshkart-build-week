@@ -1,4 +1,4 @@
-import os, uuid
+import os, time, uuid
 from datetime import datetime
 import pandas as pd
 import streamlit as st
@@ -11,7 +11,7 @@ load_dotenv()
 if not os.getenv("OPENROUTER_API_KEY"):
     st.error("OPENROUTER_API_KEY is missing. Copy .env.example to .env, add your key, and restart.")
     st.stop()
-from bot import (TICKETS, orders, customers, inventory, riders, router, reply_chain, get_history,
+from bot import (TICKETS, orders, customers, inventory, riders, router, reply_chain, get_history, bulk_triage,
                  get_order, get_customer, order_id_from)
 
 ss = st.session_state
@@ -94,6 +94,30 @@ with tab_ops:
         st.dataframe(pd.DataFrame(queue).drop(columns="route"), use_container_width=True)
     else:
         st.info("No tickets sent to a human yet in this session.")
+
+    st.subheader("Bulk triage (route only, no replies)")
+    upload = st.file_uploader("Overnight tickets CSV with columns id, message", type="csv")
+    rows = None
+    if upload is not None and st.button("Triage"):
+        df = pd.read_csv(upload, dtype=str, keep_default_na=False)  # empty cells stay "" (not NaN)
+        if {"id", "message"} <= set(df.columns):
+            rows = df.to_dict("records")
+        else:
+            st.error("The CSV needs the columns id and message.")
+    if st.button("Triage the 18 sample tickets"):
+        rows = TICKETS
+    if rows is not None:
+        t0 = time.perf_counter()
+        result = pd.DataFrame(bulk_triage.invoke(rows))
+        ss.bulk = {"result": result, "seconds": time.perf_counter() - t0,
+                   "expected": [r.get("expected_route") for r in rows]}
+    if "bulk" in ss:
+        result = ss.bulk["result"]
+        st.caption(f"{len(result)} tickets routed in {ss.bulk['seconds']:.1f}s (router.batch, max_concurrency=5)")
+        if all(ss.bulk["expected"]):
+            st.caption(f"Matches expected_route: {sum(result.route == ss.bulk['expected'])}/{len(result)}")
+        st.dataframe(result.route.value_counts().rename("tickets"))
+        st.dataframe(result, use_container_width=True)
 
 with tab_data:
     for name, df in [("orders", orders), ("customers", customers), ("inventory", inventory), ("riders", riders)]:

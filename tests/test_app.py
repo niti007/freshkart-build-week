@@ -750,6 +750,106 @@ def test_live_x4_card_summary_in_english(real_bot):
     card = card_of(real_bot, X["X4"])
     assert (card["team"], card["priority"]) == ("food_safety", "P1") and ASCII_SENTENCE.match(card["summary_en"])
 
+# ---- Ex5: bulk triage ----
+ROW_KEYS = {"id", "order_id", "intent", "language", "route", "reasons"}
+
+def test_bulk_triage_18_sample_tickets(fake_bot):
+    rows = fake_bot.bulk_triage.invoke(TICKETS)
+    assert [r["id"] for r in rows] == [t["id"] for t in TICKETS]
+    assert all(set(r) == ROW_KEYS for r in rows)
+    assert [r["route"] for r in rows] == [t["expected_route"] for t in TICKETS]
+    assert len(calls("lane")) == 0  # routed only, no replies
+
+def test_bulk_triage_reads_csv_file(fake_bot):
+    import pandas as pd
+    rows = pd.read_csv(ROOT / "data" / "tickets.csv", dtype=str, keep_default_na=False).to_dict("records")
+    assert [r["route"] for r in fake_bot.bulk_triage.invoke(rows)] == [t["expected_route"] for t in TICKETS]
+
+@pytest.mark.parametrize("bad", [{"id": "E1", "message": ""}, {"id": "E2", "message": "   \n"}, {"id": "E3"},
+                                 {"id": "E4", "message": None}])
+def test_empty_row_is_error_and_others_fine(fake_bot, bad):
+    rows = fake_bot.bulk_triage.invoke(TICKETS[:9] + [bad] + TICKETS[9:])
+    broken = rows[9]
+    assert broken["id"] == bad["id"] and broken["route"] == "error" and "empty message" in broken["reasons"]
+    good = rows[:9] + rows[10:]
+    assert [r["route"] for r in good] == [t["expected_route"] for t in TICKETS]
+    assert len(calls("intent")) == 18  # no LLM call for the empty row
+
+def test_llm_failure_on_one_row_does_not_stop_others(fake_bot):
+    def flaky_intent(call):
+        if "POISON" in call["human"]: raise auth_error()
+        return fake_intent(call)
+    FAKE["script"]["intent"] = flaky_intent
+    rows = fake_bot.bulk_triage.invoke([{"id": "P1", "message": "POISON FK1001 bread missing"}] + TICKETS)
+    assert rows[0]["route"] == "human_review" and rows[0]["intent"] == "unclear"  # Ex3: unclear, not a crash
+    assert [r["route"] for r in rows[1:]] == [t["expected_route"] for t in TICKETS]
+
+def test_to_rows_turns_exceptions_into_error_rows(fake_bot):
+    ok = decide(fake_bot, BY_ID["T01"]["message"])
+    out = fake_bot.to_rows({"rows": [{"id": "A"}, {"id": "B"}], "results": [ok, KeyError("order_id")]})
+    assert out[0] == {"id": "A", "order_id": "FK1001", "intent": "missing_item", "language": "hinglish",
+                      "route": "auto_refund", "reasons": "amount<=300, clean customer"}
+    assert out[1]["route"] == "error" and out[1]["reasons"] == "KeyError: 'order_id'" and out[1]["order_id"] is None
+
+def test_require_message(fake_bot):
+    assert fake_bot.require_message({"input": "hi"}) == {"input": "hi"}
+    with pytest.raises(ValueError, match="empty message"): fake_bot.require_message({"input": "  "})
+
+def test_bulk_batch_is_at_least_2x_faster_than_a_loop(fake_bot):
+    FAKE["delay"].update(intent=0.05, language=0.05)
+    t0 = time.perf_counter()
+    for t in TICKETS: fake_bot.router.invoke({"input": t["message"], "chat_history": []})
+    loop = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    fake_bot.bulk_triage.invoke(TICKETS)
+    batch = time.perf_counter() - t0
+    assert batch * 2 <= loop, (batch, loop)
+
+def test_max_concurrency_from_config_is_respected(fake_bot):
+    import threading
+    active, peak, lock = [0], [0], threading.Lock()
+    def counting(call):
+        with lock: active[0] += 1; peak[0] = max(peak[0], active[0])
+        time.sleep(0.03)
+        with lock: active[0] -= 1
+        return fake_intent(call)
+    FAKE["script"]["intent"] = counting
+    fake_bot.bulk_triage.invoke(TICKETS)
+    assert 1 < peak[0] <= 5
+    peak[0] = 0
+    fake_bot.bulk_triage.invoke(TICKETS, config={"max_concurrency": 1})
+    assert peak[0] == 1
+
+def test_bulk_triage_handles_a_big_backlog(fake_bot):
+    backlog = [{"id": f"{t['id']}-{i}", "message": t["message"]} for i in range(6) for t in TICKETS]  # 108 tickets
+    rows = fake_bot.bulk_triage.invoke(backlog)
+    assert len(rows) == 108 and [r["route"] for r in rows] == [t["expected_route"] for t in TICKETS] * 6
+
+def test_ui_bulk_triage_sample_button(fake_bot):
+    at = app()
+    next(b for b in at.button if b.label == "Triage the 18 sample tickets").click().run()
+    assert not at.exception
+    result = at.session_state["bulk"]["result"]
+    assert len(result) == 18 and (result.route == [t["expected_route"] for t in TICKETS]).all()
+    assert any("Matches expected_route: 18/18" in c.value for c in at.caption)
+    assert any("18 tickets routed in" in c.value for c in at.caption)
+
+def test_ui_has_csv_uploader(fake_bot):
+    at = app()
+    assert at.get("file_uploader")
+
+@live
+def test_live_bulk_triage_18_and_speed(real_bot):
+    t0 = time.perf_counter()
+    for t in TICKETS: real_bot.router.invoke({"input": t["message"], "chat_history": []})
+    loop = time.perf_counter() - t0
+    t0 = time.perf_counter()
+    rows = real_bot.bulk_triage.invoke(TICKETS + [{"id": "X5", "message": ""}])
+    batch = time.perf_counter() - t0
+    print(f"\nfor-loop {loop:.1f}s vs batch {batch:.1f}s")
+    assert [r["route"] for r in rows[:18]] == [t["expected_route"] for t in TICKETS] and rows[18]["route"] == "error"
+    assert batch * 2 <= loop
+
 # ---- live (real OpenRouter calls) ----
 @live
 @pytest.mark.parametrize("tid,route", [("T09", "human_review"), ("T01", "auto_refund")])

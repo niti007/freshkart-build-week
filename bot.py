@@ -298,6 +298,33 @@ router = (mask | RunnablePassthrough.assign(order_id=RunnableLambda(order_id_fro
 reply_chain = RunnableLambda(add_note) | RunnableParallel(reply=branch, card=card_branch)  # Ex 4: {"reply", "card"}
 full_chain = router | reply_chain
 
+# Ex 5: bulk triage for the morning backlog. router.batch(max_concurrency, return_exceptions=True) routes every ticket
+# (no replies); a RunnableLambda turns the results, some of which may be exceptions, into plain row dicts.
+# Since Ex3 an LLM outage no longer raises (the ticket becomes "unclear" -> human_review), so "error" rows come from
+# input problems. require_message makes an empty message one of those: it fails fast with no LLM call.
+def require_message(x):
+    if not x["input"].strip(): raise ValueError("empty message")
+    return x
+
+bulk_row = RunnableLambda(require_message) | router
+
+def run_batch(x, config):
+    inputs = [{"input": str(r.get("message") or ""), "chat_history": []} for r in x["rows"]]
+    return bulk_row.batch(inputs, config={**config, "max_concurrency": config.get("max_concurrency") or 5},
+                          return_exceptions=True)
+
+def to_rows(x):
+    def one(row, res):
+        if isinstance(res, Exception):
+            return {"id": row.get("id"), "order_id": None, "intent": None, "language": None, "route": "error",
+                    "reasons": f"{type(res).__name__}: {res}"}
+        return {"id": row.get("id"), "order_id": res["order_id"], "intent": res["signals"]["intent"],
+                "language": res["signals"]["language"], "route": res["route"], "reasons": "; ".join(res["reasons"])}
+    return [one(row, res) for row, res in zip(x["rows"], x["results"])]
+
+bulk_triage = (RunnableLambda(lambda rows: {"rows": rows}) | RunnablePassthrough.assign(results=RunnableLambda(run_batch))
+               | RunnableLambda(to_rows))
+
 store = {}
 def get_history(session_id):
     return store.setdefault(session_id, InMemoryChatMessageHistory())
