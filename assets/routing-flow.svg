@@ -1,0 +1,117 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1050" height="1320" viewBox="0 0 1050 1320" role="img" aria-labelledby="title desc">
+  <title id="title">FreshKart support routing flow</title>
+  <desc id="desc">Ordered decision flow from customer signals to information, delivery status, policy decline, substitution, automatic refund, or human review.</desc>
+  <defs>
+    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="5" orient="auto">
+      <path d="M0,0 L10,5 L0,10 Z" fill="#64748b"/>
+    </marker>
+    <style>
+      text { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; fill: #172033; }
+      .label { font-size: 16px; font-weight: 600; }
+      .small { font-size: 13px; font-weight: 600; }
+      .decision { fill: #eff6ff; stroke: #3b82f6; stroke-width: 2; }
+      .process { fill: #f1f5f9; stroke: #94a3b8; stroke-width: 2; }
+      .review { fill: #fff1f2; stroke: #f43f5e; stroke-width: 2; }
+      .info { fill: #ecfeff; stroke: #06b6d4; stroke-width: 2; }
+      .decline { fill: #fff7ed; stroke: #f97316; stroke-width: 2; }
+      .success { fill: #f0fdf4; stroke: #22c55e; stroke-width: 2; }
+      .connector { fill: none; stroke: #64748b; stroke-width: 2; marker-end: url(#arrow); }
+    </style>
+  </defs>
+
+  <rect x="355" y="18" width="290" height="46" rx="12" class="process"/>
+  <text x="500" y="47" text-anchor="middle" class="label">Customer message + chat history</text>
+  <path d="M500 64 V80" class="connector"/>
+  <rect x="375" y="82" width="250" height="44" rx="10" class="process"/>
+  <text x="500" y="110" text-anchor="middle" class="label">Extract signals and claim amount</text>
+  <path d="M500 126 V150" class="connector"/>
+
+  <path d="M410 150 L610 194 L410 238 L210 194 Z" class="decision"/>
+  <text x="410" y="184" text-anchor="middle" class="small">
+    <tspan x="410">Safety, misconduct, payment issue,</tspan>
+    <tspan x="410" dy="18">amount &gt; Rs 1000, or unclear intent?</tspan>
+  </text>
+  <path d="M610 194 H690 V194 H740" class="connector"/>
+  <text x="665" y="183" text-anchor="middle" class="small">Yes</text>
+  <rect x="750" y="170" width="250" height="48" rx="12" class="review"/>
+  <text x="875" y="200" text-anchor="middle" class="label">Human review</text>
+  <path d="M410 238 V295" class="connector"/>
+  <text x="426" y="271" class="small">No</text>
+
+  <path d="M410 295 L610 339 L410 383 L210 339 Z" class="decision"/>
+  <text x="410" y="334" text-anchor="middle" class="small">
+    <tspan x="410">Information intent or</tspan>
+    <tspan x="410" dy="18">no order found?</tspan>
+  </text>
+  <path d="M610 339 H690 V339 H740" class="connector"/>
+  <text x="665" y="328" text-anchor="middle" class="small">Yes</text>
+  <rect x="750" y="315" width="250" height="48" rx="12" class="info"/>
+  <text x="875" y="345" text-anchor="middle" class="label">Information response</text>
+  <path d="M410 383 V440" class="connector"/>
+  <text x="426" y="416" class="small">No</text>
+
+  <path d="M410 440 L610 484 L410 528 L210 484 Z" class="decision"/>
+  <text x="410" y="479" text-anchor="middle" class="small">
+    <tspan x="410">OMS says delivered, but rider</tspan>
+    <tspan x="410" dy="18">GPS says not delivered?</tspan>
+  </text>
+  <path d="M610 484 H690 V484 H740" class="connector"/>
+  <text x="665" y="473" text-anchor="middle" class="small">Yes</text>
+  <rect x="750" y="460" width="250" height="48" rx="12" class="review"/>
+  <text x="875" y="490" text-anchor="middle" class="label">Human review</text>
+  <path d="M410 528 V585" class="connector"/>
+  <text x="426" y="561" class="small">No</text>
+
+  <path d="M410 585 L610 629 L410 673 L210 629 Z" class="decision"/>
+  <text x="410" y="634" text-anchor="middle" class="label">WISMO intent?</text>
+  <path d="M610 629 H690 V629 H740" class="connector"/>
+  <text x="665" y="618" text-anchor="middle" class="small">Yes</text>
+  <rect x="750" y="605" width="250" height="48" rx="12" class="info"/>
+  <text x="875" y="635" text-anchor="middle" class="label">Delivery status response</text>
+  <path d="M410 673 V730" class="connector"/>
+  <text x="426" y="706" class="small">No</text>
+
+  <path d="M410 730 L610 774 L410 818 L210 774 Z" class="decision"/>
+  <text x="410" y="764" text-anchor="middle" class="small">
+    <tspan x="410">Fraud score &gt; 0.7, refunds_30d &gt; 3,</tspan>
+    <tspan x="410" dy="18">or baby product?</tspan>
+  </text>
+  <path d="M610 774 H690 V774 H740" class="connector"/>
+  <text x="665" y="763" text-anchor="middle" class="small">Yes</text>
+  <rect x="750" y="750" width="250" height="48" rx="12" class="review"/>
+  <text x="875" y="780" text-anchor="middle" class="label">Human review</text>
+  <path d="M410 818 V875" class="connector"/>
+  <text x="426" y="851" class="small">No</text>
+
+  <path d="M410 875 L610 919 L410 963 L210 919 Z" class="decision"/>
+  <text x="410" y="909" text-anchor="middle" class="small">
+    <tspan x="410">Delivered, within 48 hours, and</tspan>
+    <tspan x="410" dy="18">expiry confirmed if applicable?</tspan>
+  </text>
+  <path d="M610 919 H690 V919 H740" class="connector"/>
+  <text x="665" y="908" text-anchor="middle" class="small">No</text>
+  <rect x="750" y="895" width="250" height="48" rx="12" class="decline"/>
+  <text x="875" y="925" text-anchor="middle" class="label">Policy decline</text>
+  <path d="M410 963 V1020" class="connector"/>
+  <text x="426" y="996" class="small">Yes</text>
+
+  <path d="M410 1020 L610 1064 L410 1108 L210 1064 Z" class="decision"/>
+  <text x="410" y="1059" text-anchor="middle" class="small">Wrong item and order substituted?</text>
+  <path d="M610 1064 H690 V1064 H740" class="connector"/>
+  <text x="665" y="1053" text-anchor="middle" class="small">Yes</text>
+  <rect x="750" y="1040" width="250" height="48" rx="12" class="info"/>
+  <text x="875" y="1070" text-anchor="middle" class="label">Substitution response</text>
+  <path d="M410 1108 V1165" class="connector"/>
+  <text x="426" y="1141" class="small">No</text>
+
+  <path d="M410 1165 L610 1209 L410 1253 L210 1209 Z" class="decision"/>
+  <text x="410" y="1204" text-anchor="middle" class="label">Claim amount at most Rs 300?</text>
+  <path d="M610 1209 H690 V1209 H740" class="connector"/>
+  <text x="665" y="1198" text-anchor="middle" class="small">Yes</text>
+  <rect x="750" y="1185" width="250" height="48" rx="12" class="success"/>
+  <text x="875" y="1215" text-anchor="middle" class="label">Automatic refund</text>
+  <path d="M410 1253 V1280 H740" class="connector"/>
+  <text x="426" y="1275" class="small">No</text>
+  <rect x="750" y="1256" width="250" height="48" rx="12" class="review"/>
+  <text x="875" y="1286" text-anchor="middle" class="label">Human review</text>
+</svg>
