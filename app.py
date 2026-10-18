@@ -35,6 +35,11 @@ def why(m):
             st.markdown(f":violet[🛡️ **PII masked: {m['pii_count']} item(s)**]")
             st.caption("Prompt input sent to LLM:")
             st.code(m.get("masked_input", ""), language="text")
+        if m.get("guard_verdict"):
+            if m["guard_verdict"] == "safe":
+                st.markdown(":green[🛡️ **Reply Guard:** Passed (clean draft)]")
+            else:
+                st.markdown(f":red[🚨 **Reply Guard:** Intercepted ({m.get('guard_reason', 'violation')})] — Replaced with legal template")
         if m.get("tracker"):
             st.markdown("⏱️ **Conveyor Belt Station Timings:**")
             for e in sorted(m["tracker"], key=lambda x: x["start_time"]):
@@ -68,6 +73,8 @@ with tab_chat:
     for m in ss.messages:
         with st.chat_message(m["role"]):
             st.write(m["content"])
+            if m.get("guard_verdict") == "unsafe":
+                st.warning(f"🚨 **Reply Guard Intercepted**: {m.get('guard_reason', 'Violation detected')} — Replaced with compliant legal template.")
             if m.get("card"):
                 c = m["card"]
                 st.info(f"📋 **Ops Escalation Card** [{c['priority']}] → **Team:** `{c['team']}`\n\n"
@@ -95,13 +102,20 @@ with tab_chat:
                         yield chunk
             reply = st.write_stream(stream_tokens(reply_chain.stream(decision, config=cfg_tracked)))
             card_data = card_holder[0]
+            guard_event = next((e for e in tracker if e["name"] == "reply_guard"), None)
+            guard_out = guard_event.get("outputs") if guard_event else None
+            g_verdict = guard_out.get("verdict") if isinstance(guard_out, dict) else None
+            g_reason = guard_out.get("reason") if isinstance(guard_out, dict) else None
+            if g_verdict == "unsafe":
+                st.warning(f"🚨 **Reply Guard Intercepted**: {g_reason} — Replaced with compliant legal template.")
             if card_data:
                 st.info(f"📋 **Ops Escalation Card** [{card_data['priority']}] → **Team:** `{card_data['team']}`\n\n"
                         f"**Summary:** {card_data['summary_en']}\n\n**Next Step:** {card_data['next_step']}")
             m = {"role": "assistant", "content": reply, "route": decision["route"],
                  "reasons": decision["reasons"], "signals": decision["signals"],
                  "pii_count": decision.get("pii_count", 0), "masked_input": decision.get("masked_input", ""),
-                 "card": card_data, "tracker": list(tracker)}
+                 "card": card_data, "tracker": list(tracker),
+                 "guard_verdict": g_verdict, "guard_reason": g_reason}
             why(m)
         history.add_user_message(decision.get("masked_input", msg))
         history.add_ai_message(reply)
@@ -184,7 +198,8 @@ with tab_how:
         ("Cell 23 Bulk Triage", "bulk_triage", "Ops queue bulk CSV triage"),
         ("Cell 24 Configurable Alternatives", "llm, compare_models", "Sidebar LLM Model switcher & Benchmark"),
         ("Cell 25 Live Pipeline Tracker", "track, with_listeners", "Conveyor Belt Status & timings in Chat"),
-        ("Cell 26 Evaluation", "router", "Sample ticket + Send"),
+        ("Cell 26 Reply Guard (Bonus)", "guarded_lane, check_reply_safety", "Intercepts unauthorized promises in escalations"),
+        ("Cell 27 Evaluation", "router", "Sample ticket + Send"),
     ], columns=["Notebook cell", "bot.py", "App widget"]))
 
 # Sidebar order panel for the latest message

@@ -233,9 +233,52 @@ def lane(instruction):
     fallback = RunnableLambda(lambda _: FALLBACK_REPLY)
     return primary.with_fallbacks([backup, fallback])
 
+# Cell 20: Reply Guard (Bonus Exercise)
+GUARD_REGEX = re.compile(
+    r"(₹|rs\.?|inr)\s*\d+|\d+\s*(rupees|rs)|"
+    r"refund(ed)?\s+(today|tomorrow|in \d+|within \d+|instantly)|"
+    r"\b(route|reasons?|internal note|fraud_score|gps_delivered)\b",
+    re.IGNORECASE
+)
+
+guard_prompt = ChatPromptTemplate.from_messages([
+    ("system", "You are a legal compliance checker for FreshKart support.\n"
+               "Does this support reply draft promise a specific refund amount or date, or reveal internal debugging terms (route, reasons, note)?\n"
+               "Answer ONLY yes or no."),
+    ("human", "{draft}")
+])
+guard_chain = guard_prompt | llm | StrOutputParser() | RunnableLambda(lambda t: "unsafe" if "yes" in t.lower() else "safe")
+
+def check_reply_safety(x):
+    draft = x["draft"]
+    if bool(GUARD_REGEX.search(draft)):
+        return {"verdict": "unsafe", "reason": "regex match (currency/date/internal leak)"}
+    res = guard_chain.invoke({"draft": draft})
+    v = "unsafe" if "yes" in res.lower() else "safe"
+    return {"verdict": v, "reason": "llm compliance check" if v == "unsafe" else "clean"}
+
+SAFE_TEMPLATES = {
+    "human_review": "A senior FreshKart support specialist has been assigned to your case and will contact you shortly.",
+    "policy_decline": "We are unable to process this request per FreshKart policy. Please reach out if you would like a supervisor to review this decision.",
+}
+
+def guarded_lane(route_name, instruction):
+    base_lane = lane(instruction)
+    fallback_text = SAFE_TEMPLATES.get(route_name, "A FreshKart support specialist will contact you shortly.")
+    return (
+        RunnablePassthrough.assign(draft=base_lane)
+        | RunnablePassthrough.assign(guard_check=track(RunnableLambda(check_reply_safety), "reply_guard"))
+        | RunnableBranch(
+            (lambda x: x["guard_check"]["verdict"] == "safe", lambda x: x["draft"]),
+            RunnableLambda(lambda _: fallback_text)
+        )
+    )
+
 branch = RunnableBranch(
-    *[(lambda x, name=name: x["route"] == name, lane(text)) for name, text in LANES.items() if name != "human_review"],
-    lane(LANES["human_review"]),
+    *[(lambda x, name=name: x["route"] == name,
+       guarded_lane(name, text) if name in {"human_review", "policy_decline"} else lane(text))
+      for name, text in LANES.items() if name != "human_review"],
+    guarded_lane("human_review", LANES["human_review"]),
 )
 
 # Cell 21: Ops Hand-off Card (Exercise 4)
