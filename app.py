@@ -86,12 +86,12 @@ with tab_chat:
         history = get_history(ss.sid)
         tracker = []
         cfg_tracked = {"configurable": {"model": selected_model, "tracker": tracker}}
+        with st.status("Conveyor belt processing ticket...", expanded=True) as status_box:
+            decision = router.invoke({"input": msg, "chat_history": history.messages}, config=cfg_tracked)
+            for e in sorted(tracker, key=lambda x: x["start_time"]):
+                st.write(f"✓ **{e['name']}** `{e['duration']:.4f}s`")
+            status_box.update(label=f"Belt routed: :{COLORS[decision['route']]}[**{decision['route']}**] ({len(tracker)} stations)", state="complete", expanded=False)
         with st.chat_message("assistant"):
-            with st.status("Conveyor belt processing ticket...", expanded=True) as status_box:
-                decision = router.invoke({"input": msg, "chat_history": history.messages}, config=cfg_tracked)
-                for e in sorted(tracker, key=lambda x: x["start_time"]):
-                    st.write(f"✓ **{e['name']}** `{e['duration']:.4f}s`")
-                status_box.update(label=f"Belt routed: :{COLORS[decision['route']]}[**{decision['route']}**] ({len(tracker)} stations)", state="complete", expanded=False)
             card_holder = [None]
             def stream_tokens(gen):
                 for chunk in gen:

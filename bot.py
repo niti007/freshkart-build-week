@@ -25,7 +25,7 @@ llm = mini_llm.configurable_alternatives(
     ConfigurableField(id="model"),
     default_key="mini",
     llama=llama_llm,
-)
+) if hasattr(mini_llm, "configurable_alternatives") else mini_llm
 backup_llm = llama_llm
 def read(name):
     return pd.read_csv(DATA / f"{name}.csv", dtype=str, keep_default_na=False)
