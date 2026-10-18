@@ -1,12 +1,12 @@
 """FreshKart support bot: the notebook (freshkart_lcel.ipynb) moved into a .py file."""
-import os, re, sys
+import os, re, sys, time
 from pathlib import Path
 import pandas as pd
 from dotenv import load_dotenv
 from langchain_openai import ChatOpenAI
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.output_parsers import StrOutputParser, JsonOutputParser
-from langchain_core.runnables import RunnableLambda, RunnablePassthrough, RunnableParallel, RunnableBranch
+from langchain_core.runnables import RunnableLambda, RunnablePassthrough, RunnableParallel, RunnableBranch, ConfigurableField
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_core.chat_history import InMemoryChatMessageHistory
 
@@ -14,21 +14,22 @@ from langchain_core.chat_history import InMemoryChatMessageHistory
 load_dotenv()
 DATA = Path(__file__).parent / "data"
 
-def get_llm():
-    return ChatOpenAI(model=os.getenv("MODEL", "openai/gpt-4o-mini"),
+mini_llm = ChatOpenAI(model=os.getenv("MODEL", "openai/gpt-4o-mini"),
                       base_url="https://openrouter.ai/api/v1",
                       api_key=os.getenv("OPENROUTER_API_KEY"), temperature=0, max_retries=0)
+llama_llm = ChatOpenAI(model=os.getenv("BACKUP_MODEL", "meta-llama/llama-3.1-8b-instruct"),
+                       base_url="https://openrouter.ai/api/v1",
+                       api_key=os.getenv("OPENROUTER_API_KEY"), temperature=0, max_retries=0)
 
-def get_backup_llm():
-    return ChatOpenAI(model=os.getenv("BACKUP_MODEL", "meta-llama/llama-3.1-8b-instruct"),
-                      base_url="https://openrouter.ai/api/v1",
-                      api_key=os.getenv("OPENROUTER_API_KEY"), temperature=0, max_retries=0)
-
+llm = mini_llm.configurable_alternatives(
+    ConfigurableField(id="model"),
+    default_key="mini",
+    llama=llama_llm,
+)
+backup_llm = llama_llm
 def read(name):
     return pd.read_csv(DATA / f"{name}.csv", dtype=str, keep_default_na=False)
 
-llm = get_llm()
-backup_llm = get_backup_llm()
 orders, customers, inventory, riders, tickets = [read(n) for n in
                                                  ["orders", "customers", "inventory", "riders", "tickets"]]
 TICKETS = tickets.to_dict("records")
@@ -127,15 +128,38 @@ offline_nlu = RunnableLambda(lambda _: {"intent": "unclear", "sentiment": "neutr
 
 nlu_chain = RunnableLambda(lambda x: {"input": x["masked_input"]}) | primary_nlu.with_fallbacks([backup_nlu, offline_nlu])
 
+# Cell 19: Live Pipeline Tracker (Exercise 7)
+def make_tracker_listener():
+    def on_end(run, config):
+        tracker = config.get("configurable", {}).get("tracker")
+        if tracker is not None:
+            dur = (run.end_time - run.start_time).total_seconds() if (run.end_time and run.start_time) else 0.0
+            tracker.append({
+                "name": run.name,
+                "start_time": run.start_time,
+                "end_time": run.end_time,
+                "duration": dur,
+                "outputs": getattr(run, "outputs", None),
+            })
+    return on_end
+
+tracker_listener = make_tracker_listener()
+
+def track(r, name):
+    return r.with_config(run_name=name).with_listeners(on_end=tracker_listener)
+
 oid = lambda f: RunnableLambda(lambda x: f(x["order_id"]))
 signals = RunnableParallel(
-    intent=RunnableLambda(lambda x: x["nlu"]["intent"]),
-    language=RunnableLambda(lambda x: x["nlu"]["language"]),
-    sentiment=RunnableLambda(lambda x: x["nlu"]["sentiment"]),
-    model_used=RunnableLambda(lambda x: x["nlu"]["model_used"]),
-    order=oid(get_order), customer=oid(get_customer), inventory=oid(check_inventory), rider=oid(get_rider),
-    safety=RunnableLambda(lambda x: has_safety(x["input"])),
-    claimed_amount=RunnableLambda(lambda x: claimed_amount(x["input"])),
+    intent=RunnableLambda(lambda x: x["nlu"]["intent"]).with_config(run_name="signal_intent"),
+    language=RunnableLambda(lambda x: x["nlu"]["language"]).with_config(run_name="signal_language"),
+    sentiment=RunnableLambda(lambda x: x["nlu"]["sentiment"]).with_config(run_name="signal_sentiment"),
+    model_used=RunnableLambda(lambda x: x["nlu"]["model_used"]).with_config(run_name="signal_model_used"),
+    order=track(oid(get_order), "order_lookup"),
+    customer=track(oid(get_customer), "customer_lookup"),
+    inventory=track(oid(check_inventory), "inventory_lookup"),
+    rider=track(oid(get_rider), "rider_lookup"),
+    safety=track(RunnableLambda(lambda x: has_safety(x["input"])), "safety_check"),
+    claimed_amount=track(RunnableLambda(lambda x: claimed_amount(x["input"])), "amount_extract"),
 )
 
 # Cell 18: decide_route (rules in plain Python, first match wins)
@@ -252,13 +276,13 @@ card_branch = RunnableBranch(
 
 # Cell 22: full chain + memory. The app uses router (decide) then reply_chain (stream) to avoid a 2nd intent call.
 router = (RunnablePassthrough.assign(
-              masked_input=RunnableLambda(lambda x: mask_pii(x["input"])[0]),
+              masked_input=track(RunnableLambda(lambda x: mask_pii(x["input"])[0]), "pii_masking"),
               pii_count=RunnableLambda(lambda x: mask_pii(x["input"])[1]))
-          | RunnablePassthrough.assign(order_id=RunnableLambda(order_id_from))
-          | RunnablePassthrough.assign(nlu=nlu_chain)
-          | RunnablePassthrough.assign(signals=signals)
-          | RunnableLambda(decide_route))
-reply_chain = RunnableLambda(add_note) | RunnableParallel(reply=branch, card=card_branch)
+          | RunnablePassthrough.assign(order_id=track(RunnableLambda(order_id_from), "find_order_id"))
+          | RunnablePassthrough.assign(nlu=track(nlu_chain, "intent_llm"))
+          | RunnablePassthrough.assign(signals=track(signals, "signals_parallel"))
+          | track(RunnableLambda(decide_route), "decide_route"))
+reply_chain = track(RunnableLambda(add_note), "add_note") | RunnableParallel(reply=track(branch, "reply_generation"), card=track(card_branch, "card_generation"))
 full_chain = router | reply_chain
 
 store = {}
@@ -268,9 +292,12 @@ def get_history(session_id):
 bot = RunnableWithMessageHistory(full_chain, get_history, input_messages_key="input", history_messages_key="chat_history")
 
 # Cell 23: Bulk Triage (Exercise 5)
-def run_bulk_triage(tickets_list, concurrency=5):
+def run_bulk_triage(tickets_list, config=None):
+    cfg = {"max_concurrency": 5}
+    if config:
+        cfg.update(config)
     inputs = [{"input": str(t.get("message", "")), "chat_history": []} for t in tickets_list]
-    raw_results = router.batch(inputs, config={"max_concurrency": concurrency}, return_exceptions=True)
+    raw_results = router.batch(inputs, config=cfg, return_exceptions=True)
     output = []
     for t, res in zip(tickets_list, raw_results):
         if isinstance(res, Exception):
@@ -284,6 +311,18 @@ def run_bulk_triage(tickets_list, concurrency=5):
     return output
 
 bulk_triage = RunnableLambda(run_bulk_triage)
+
+# Cell 24: Model Comparison (Exercise 6)
+def compare_models(tickets=TICKETS, model_keys=["mini", "llama"]):
+    results = {}
+    for m in model_keys:
+        t0 = time.time()
+        batch_res = router.batch([{"input": t["message"], "chat_history": []} for t in tickets],
+                                 config={"configurable": {"model": m}, "max_concurrency": 5})
+        elapsed = time.time() - t0
+        score = sum(r["route"] == t["expected_route"] for r, t in zip(batch_res, tickets))
+        results[m] = {"score": score, "time": elapsed}
+    return results
 
 if __name__ == "__main__":  # python bot.py T09
     t = next(t for t in TICKETS if t["id"] == (sys.argv[1] if len(sys.argv) > 1 else "T01"))

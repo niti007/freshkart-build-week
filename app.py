@@ -12,7 +12,7 @@ if not os.getenv("OPENROUTER_API_KEY"):
     st.error("OPENROUTER_API_KEY is missing. Copy .env.example to .env, add your key, and restart.")
     st.stop()
 from bot import (TICKETS, orders, customers, inventory, riders, router, reply_chain, get_history,
-                 get_order, get_customer, order_id_from, bulk_triage)
+                 get_order, get_customer, order_id_from, bulk_triage, compare_models)
 
 ss = st.session_state
 ss.setdefault("sid", uuid.uuid4().hex[:8])
@@ -35,6 +35,10 @@ def why(m):
             st.markdown(f":violet[🛡️ **PII masked: {m['pii_count']} item(s)**]")
             st.caption("Prompt input sent to LLM:")
             st.code(m.get("masked_input", ""), language="text")
+        if m.get("tracker"):
+            st.markdown("⏱️ **Conveyor Belt Station Timings:**")
+            for e in sorted(m["tracker"], key=lambda x: x["start_time"]):
+                st.write(f"- ✓ `{e['name']}`: {e['duration']:.4f}s")
         st.json(m["signals"])
 
 # Sidebar
@@ -42,6 +46,14 @@ sample = None
 with st.sidebar:
     st.header("About")
     st.write("Rules-based support bot: signals in parallel, routing in plain Python, then a streamed reply.")
+    selected_model = st.selectbox("LLM Model", ["mini", "llama"], index=0, help="Switch model at runtime via ConfigurableField")
+    cfg = {"configurable": {"model": selected_model}}
+    if st.button("Benchmark models (18 tickets)"):
+        with st.spinner("Benchmarking mini vs llama on 18 tickets (max_concurrency=5)..."):
+            cmp_res = compare_models()
+        for m_name, res in cmp_res.items():
+            st.write(f"**{m_name}**: {res['score']}/18 accurate ({res['time']:.2f}s)")
+    st.divider()
     choice = st.selectbox("Try a sample ticket", TICKETS, format_func=lambda t: f"{t['id']}: {' '.join(t['message'].split()[:6])}...")
     if st.button("Send"):
         sample = choice["message"]
@@ -65,9 +77,14 @@ with tab_chat:
         with st.chat_message("user"):
             st.write(msg)
         history = get_history(ss.sid)
+        tracker = []
+        cfg_tracked = {"configurable": {"model": selected_model, "tracker": tracker}}
         with st.chat_message("assistant"):
-            with st.spinner("Checking order, customer and policy..."):
-                decision = router.invoke({"input": msg, "chat_history": history.messages})
+            with st.status("Conveyor belt processing ticket...", expanded=True) as status_box:
+                decision = router.invoke({"input": msg, "chat_history": history.messages}, config=cfg_tracked)
+                for e in sorted(tracker, key=lambda x: x["start_time"]):
+                    st.write(f"✓ **{e['name']}** `{e['duration']:.4f}s`")
+                status_box.update(label=f"Belt routed: :{COLORS[decision['route']]}[**{decision['route']}**] ({len(tracker)} stations)", state="complete", expanded=False)
             card_holder = [None]
             def stream_tokens(gen):
                 for chunk in gen:
@@ -76,7 +93,7 @@ with tab_chat:
                         if "reply" in chunk and chunk["reply"]: yield chunk["reply"]
                     else:
                         yield chunk
-            reply = st.write_stream(stream_tokens(reply_chain.stream(decision)))
+            reply = st.write_stream(stream_tokens(reply_chain.stream(decision, config=cfg_tracked)))
             card_data = card_holder[0]
             if card_data:
                 st.info(f"📋 **Ops Escalation Card** [{card_data['priority']}] → **Team:** `{card_data['team']}`\n\n"
@@ -84,7 +101,7 @@ with tab_chat:
             m = {"role": "assistant", "content": reply, "route": decision["route"],
                  "reasons": decision["reasons"], "signals": decision["signals"],
                  "pii_count": decision.get("pii_count", 0), "masked_input": decision.get("masked_input", ""),
-                 "card": card_data}
+                 "card": card_data, "tracker": list(tracker)}
             why(m)
         history.add_user_message(decision.get("masked_input", msg))
         history.add_ai_message(reply)
@@ -117,7 +134,7 @@ with tab_ops:
         if st.button("Triage", key="btn_run_bulk_triage"):
             with st.spinner(f"Triaging {len(df_upload)} tickets in parallel (concurrency=5)..."):
                 t0 = time.time()
-                triaged = bulk_triage.invoke(df_upload.to_dict("records"))
+                triaged = bulk_triage.invoke(df_upload.to_dict("records"), config=cfg)
                 elapsed = time.time() - t0
             df_triaged = pd.DataFrame(triaged)
             st.success(f"Triaged {len(df_triaged)} tickets in {elapsed:.2f}s!")
@@ -165,7 +182,9 @@ with tab_how:
         ("Cell 21 Ops Card", "card_chain, card_branch", "Ops escalation card in Chat & Queue"),
         ("Cell 22 Memory", "full_chain, store, get_history", "New chat button"),
         ("Cell 23 Bulk Triage", "bulk_triage", "Ops queue bulk CSV triage"),
-        ("Cell 24 Evaluation", "router", "Sample ticket + Send"),
+        ("Cell 24 Configurable Alternatives", "llm, compare_models", "Sidebar LLM Model switcher & Benchmark"),
+        ("Cell 25 Live Pipeline Tracker", "track, with_listeners", "Conveyor Belt Status & timings in Chat"),
+        ("Cell 26 Evaluation", "router", "Sample ticket + Send"),
     ], columns=["Notebook cell", "bot.py", "App widget"]))
 
 # Sidebar order panel for the latest message
